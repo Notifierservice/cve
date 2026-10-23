@@ -1,27 +1,30 @@
-# Scan dependencies
+# Dependency scan
 python scanner.py scan requirements.txt -o findings.json --html report.html
 
-# Scan npm deps
-python scanner.py scan package.json -o findings.json
+# URL DAST scan
+python scanner.py scan https://staging.example.com --severity critical,high
 
-# Scan URL via Nuclei DAST
-python scanner.py scan https://staging.example.com -o dast.json
-
-# Probe findings against live target
+# Probe with active PoCs
 python scanner.py probe findings.json --target https://staging.example.com \
-    --header "Authorization: Bearer $TOKEN" -o verified.json --html verified.html
+    -o verified.json --html verified.html
 
-# Dry-run (no payloads sent)
-python scanner.py probe findings.json --target https://staging.example.com --dry-run
+# Probe + fingerprint real host libraries
+python scanner.py probe findings.json --target https://staging.example.com \
+    --fingerprint \
+    -o verified.json --html verified.html
 
-# Authenticated probe with WAF evasion
+# Authenticated, WAF-aware, rate-limited
 python scanner.py probe findings.json --target https://app.example.com \
-    --basic-auth admin:pass --cookie "session=abc" --waf-bypass \
-    --profile stealth --insecure -o verified.json
+    --header "Authorization: Bearer $TOKEN" \
+    --cookie "session=abc123" \
+    --basic-auth admin:pass \
+    --waf-bypass --profile stealth --insecure \
+    --fingerprint \
+    -o verified.json --html verified.html
 
-# Look up one CVE
+# Single CVE lookup
 python scanner.py enrich CVE-2024-3400
 
 # Inspect libraries
-python scanner.py --list-cves
-python scanner.py --list-payloads
+python scanner.py --list-cves       # 45 entries
+python scanner.py --list-payloads   # 14 CWE probes
