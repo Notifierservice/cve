@@ -1,31 +1,27 @@
 #!/usr/bin/env python3
 """
-scanner.py — Free CVE scanner with CVE + CWE PoC verification and host
-fingerprinting.
+scanner.py — Free network-focused CVE scanner with active PoC verification
+and host fingerprinting.
 
 ⚠️  AUTHORIZED USE ONLY
-`probe` and `scan <url>` send real exploit payloads. Use only against systems
-you own or have written permission to test.
+`scan` and `probe` send real traffic and exploit payloads. Use only against
+systems you own or have written permission to test.
 
 Commands:
-  scan    Scan a dependency file OR a URL (Nuclei DAST)
-  probe   Verify findings against a live target with CVE + CWE PoCs
-          (optionally fingerprint host libraries via NVD CPE)
+  scan    Scan an IP, domain, or URL (port scan + fingerprint + Nuclei DAST)
+  probe   Verify findings with CVE + CWE PoCs against a live target
   enrich  Look up a single CVE
 
 Usage:
-  python scanner.py scan requirements.txt -o findings.json --html report.html
-  python scanner.py scan package.json
-  python scanner.py scan https://staging.example.com
-  python scanner.py probe findings.json --target https://staging.example.com \\
-      --header "Authorization: Bearer $TOKEN" -o verified.json --html verified.html
-  python scanner.py probe findings.json --target https://staging.example.com \\
-      --fingerprint -o verified.json --html verified.html
+  python scanner.py scan 192.168.1.1 -o findings.json --html report.html
+  python scanner.py scan example.com -o findings.json
+  python scanner.py scan https://staging.example.com -o findings.json
+  python scanner.py probe findings.json --target example.com -o verified.json
   python scanner.py enrich CVE-2024-3400
   python scanner.py --list-cves
   python scanner.py --list-payloads
 
-Free data sources: OSV.dev, NVD 2.0, CISA KEV, EPSS.
+Free data sources: OSV (N/A now), NVD 2.0, CISA KEV, EPSS.
 Optional: Nuclei for OOB templates and per-CVE verification.
 """
 from __future__ import annotations
@@ -48,7 +44,6 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse, parse_qs, quote
 
-# ── Required dependencies ──
 try:
     import requests
     from requests.adapters import HTTPAdapter
@@ -62,6 +57,27 @@ try:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 except Exception:
     pass
+
+# ── Network helpers ──
+try:
+    from network import (
+        normalize_target, extract_host, extract_port,
+        port_scan, auto_banner_grab, tls_info,
+        detect_working_url, COMMON_PORTS,
+    )
+except ImportError as e:
+    print(f"Error importing network: {e}", file=sys.stderr)
+    print("Make sure network.py is in the same directory as scanner.py",
+          file=sys.stderr)
+    sys.exit(1)
+
+# ── Fingerprinting ──
+try:
+    from fingerprint import fingerprint_http, fingerprint_banner
+    _HAVE_FINGERPRINT = True
+except ImportError:
+    _HAVE_FINGERPRINT = False
+    fingerprint_http = fingerprint_banner = None
 
 # ── Payload library ──
 try:
@@ -79,21 +95,12 @@ except ImportError as e:
           file=sys.stderr)
     sys.exit(1)
 
-# ── Fingerprinting (optional) ──
-try:
-    from fingerprint import fingerprint_and_lookup
-    _HAVE_FINGERPRINT = True
-except ImportError:
-    _HAVE_FINGERPRINT = False
-    fingerprint_and_lookup = None
-
 
 # ================================================================
 # CONFIG
 # ================================================================
 __version__ = "9.0.0"
 
-OSV_API  = "https://api.osv.dev/v1/query"
 NVD_API  = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 KEV_URL  = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 EPSS_API = "https://api.first.org/data/v1/epss"
@@ -125,7 +132,6 @@ def cwe_list_friendly(cwes: List[str]) -> str:
 # SIGNATURE HELPERS
 # ================================================================
 def _normalize_signatures(signatures) -> Iterable[Tuple[str, str]]:
-    """Accept dict {label: pattern} or list [(pattern, label)]."""
     if isinstance(signatures, dict):
         for label, pattern in signatures.items():
             yield label, pattern
@@ -137,10 +143,8 @@ def _normalize_signatures(signatures) -> Iterable[Tuple[str, str]]:
 
 
 def match_signatures(
-    text: str,
-    signatures,
-    *,
-    baseline_text: Optional[str] = None,
+    text: str, signatures,
+    *, baseline_text: Optional[str] = None,
     case_insensitive: bool = True,
 ) -> List[str]:
     flags = re.IGNORECASE if case_insensitive else 0
@@ -225,13 +229,6 @@ def http_get(url: str, params=None, headers=None, timeout=30) -> dict:
     return r.json()
 
 
-def http_post(url: str, data: dict, timeout=30) -> dict:
-    h = {"User-Agent": f"cve-scanner/{__version__}"}
-    r = requests.post(url, json=data, headers=h, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
-
-
 # ================================================================
 # CACHE
 # ================================================================
@@ -269,7 +266,6 @@ def save_cache(name: str, data: dict) -> None:
 # NVD / KEV / EPSS
 # ================================================================
 class _NvdRateLimiter:
-    """Thread-safe NVD rate limiter — 5/30s no key, 50/30s with key."""
     def __init__(self):
         self.rate = 50.0 / 30.0 if NVD_API_KEY else 5.0 / 30.0
         self.lock = threading.Lock()
@@ -327,11 +323,8 @@ def fetch_nvd_cve(cve_id: str, _retry: int = 0) -> Optional[dict]:
     except requests.HTTPError as e:
         if e.response is not None and e.response.status_code == 429:
             if _retry >= NVD_MAX_RETRIES:
-                log.warning(f"NVD rate limit exceeded for {cve_id}")
                 return None
-            wait = 30 * (2 ** _retry)
-            log.info(f"NVD rate limited, sleeping {wait}s...")
-            time.sleep(wait)
+            time.sleep(30 * (2 ** _retry))
             return fetch_nvd_cve(cve_id, _retry + 1)
         log.warning(f"NVD lookup failed for {cve_id}: {e}")
         return None
@@ -361,96 +354,6 @@ def extract_cwe(nvd: dict) -> List[str]:
             if v.startswith("CWE-") and v not in cwes:
                 cwes.append(v)
     return cwes
-
-
-# ================================================================
-# OSV
-# ================================================================
-def parse_requirements(path: Path) -> List[Tuple[str, str]]:
-    deps = []
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or line.startswith("-"):
-            continue
-        m = re.match(r"^([A-Za-z0-9_.-]+)\s*==\s*([^\s;#]+)", line)
-        if m:
-            deps.append((m.group(1), m.group(2)))
-            continue
-        m2 = re.match(r"^([A-Za-z0-9_.-]+)", line)
-        if m2:
-            deps.append((m2.group(1), ""))
-    return deps
-
-
-def parse_package_json(path: Path) -> List[Tuple[str, str]]:
-    data = json.loads(path.read_text())
-    deps = []
-    for section in ("dependencies", "devDependencies"):
-        for name, ver in data.get(section, {}).items():
-            deps.append((name, re.sub(r"^[~^>=<]+", "", ver).strip()))
-    return deps
-
-
-def osv_query(package: str, version: str, ecosystem: str) -> List[dict]:
-    if not version:
-        return []
-    payload = {"package": {"name": package, "ecosystem": ecosystem},
-               "version": version}
-    try:
-        return http_post(OSV_API, payload).get("vulns", [])
-    except Exception as e:
-        log.warning(f"OSV query failed {package}=={version}: {e}")
-        return []
-
-
-def _osv_one(args: Tuple[str, str, str]) -> List[dict]:
-    pkg, ver, eco = args
-    findings = []
-    for v in osv_query(pkg, ver, eco):
-        f = {
-            "package": pkg, "version": ver, "ecosystem": eco,
-            "id": v.get("id"), "aliases": v.get("aliases", []),
-            "summary": v.get("summary", ""), "source": "OSV",
-            "cve_id": None, "cwe": [],
-        }
-        for a in f["aliases"]:
-            if a.startswith("CVE-"):
-                f["cve_id"] = a
-                break
-        db = v.get("database_specific", {}) or {}
-        cwe_field = db.get("cwe_ids") or db.get("cwes") or []
-        if isinstance(cwe_field, list):
-            f["cwe"] = [c for c in cwe_field if str(c).startswith("CWE-")]
-        findings.append(f)
-    return findings
-
-
-def scan_dependencies(path: Path, workers: int = 8) -> List[dict]:
-    if path.name == "requirements.txt":
-        deps, eco = parse_requirements(path), "PyPI"
-    elif path.name == "package.json":
-        deps, eco = parse_package_json(path), "npm"
-    else:
-        log.error(f"Unsupported file: {path.name}")
-        return []
-
-    log.info(f"Scanning {path} ({len(deps)} deps, ecosystem={eco})...")
-    findings: List[dict] = []
-    done = 0
-
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {
-            ex.submit(_osv_one, (pkg, ver, eco)): (pkg, ver)
-            for pkg, ver in deps
-        }
-        for fut in as_completed(futures):
-            if _SHUTDOWN.is_set():
-                break
-            findings.extend(fut.result())
-            done += 1
-            if done % 20 == 0 or done == len(deps):
-                log.info(f"  Scanned {done}/{len(deps)}")
-    return findings
 
 
 # ================================================================
@@ -502,8 +405,10 @@ def enrich_findings(findings: List[dict], workers: int = 1) -> List[dict]:
             priority = "HIGH"
         elif cvss is not None and cvss >= 4.0:
             priority = "MEDIUM"
-        else:
+        elif cid:
             priority = "LOW"
+        else:
+            priority = "INFO"
 
         f.update({"cwe": merged_cwe, "cvss": cvss, "epss": round(epss, 4),
                   "in_kev": in_kev, "priority": priority})
@@ -511,20 +416,6 @@ def enrich_findings(findings: List[dict], workers: int = 1) -> List[dict]:
         f["false_positive_status"] = status
         f["false_positive_reason"] = reason
     return findings
-
-
-def ensure_metadata(findings: List[dict]) -> None:
-    for f in findings:
-        cid = f.get("cve_id")
-        if not cid or (f.get("cwe") and f.get("cvss") is not None):
-            continue
-        nvd = fetch_nvd_cve(cid)
-        if not nvd:
-            continue
-        if not f.get("cwe"):
-            f["cwe"] = extract_cwe(nvd)
-        if f.get("cvss") is None:
-            f["cvss"] = extract_cvss(nvd)
 
 
 # ================================================================
@@ -543,6 +434,10 @@ def assess_false_positive(finding: dict) -> Tuple[str, str]:
             status = fp or "LIKELY_FALSE_POSITIVE"
             return (status, v.get("evidence", "PoC did not trigger"))
 
+    # Informational findings (port open, service detected) — no CVE
+    if finding.get("source") in ("PortScan", "Banner", "Fingerprint"):
+        return ("CONFIRMED", finding.get("summary", "Observed on target"))
+
     if finding.get("in_kev"):
         return ("CONFIRMED", "Listed in CISA KEV — exploited in the wild")
     if finding.get("source") == "Nuclei":
@@ -550,7 +445,7 @@ def assess_false_positive(finding: dict) -> Tuple[str, str]:
 
     cve = finding.get("cve_id")
     if not cve:
-        return ("LIKELY_FALSE_POSITIVE", "No CVE assigned (advisory only)")
+        return ("LIKELY_FALSE_POSITIVE", "No CVE assigned")
 
     epss = finding.get("epss", 0.0) or 0.0
     if epss >= 0.1:
@@ -649,11 +544,9 @@ def send_request(session, url, method, data, timeout=15,
             return session.post(url, json=json_body, **kw)
         return session.post(url, data=data, **kw)
     except (requests.Timeout, requests.ConnectionError,
-            requests.TooManyRedirects) as e:
-        log.debug(f"request error {url}: {e}")
+            requests.TooManyRedirects):
         return None
-    except Exception as e:
-        log.debug(f"unexpected error {url}: {e}")
+    except Exception:
         return None
 
 
@@ -754,8 +647,7 @@ def verify_with_cve(target_url: str, cve_id: str, session,
     if dry_run:
         paths = [p.get("path", "/") for p in probe["probes"]]
         return {
-            "status": "DRY_RUN",
-            "fp_status": "NEEDS_REVIEW",
+            "status": "DRY_RUN", "fp_status": "NEEDS_REVIEW",
             "method": f"{cve_id} {probe['label']} (dry run)",
             "evidence": f"Would test {n_probes} endpoint(s): {paths}",
         }
@@ -804,23 +696,20 @@ def verify_with_cve(target_url: str, cve_id: str, session,
         )
         if hits:
             return {
-                "status": "CONFIRMED",
-                "fp_status": "CONFIRMED",
+                "status": "CONFIRMED", "fp_status": "CONFIRMED",
                 "method": f"{cve_id} {probe['label']}",
                 "evidence": f"{url}: {hits}",
             }
 
     if waf_blocks:
         return {
-            "status": "WAF_BLOCKED",
-            "fp_status": "UNVERIFIED",
+            "status": "WAF_BLOCKED", "fp_status": "UNVERIFIED",
             "method": f"{cve_id} {probe['label']}",
             "evidence": f"{waf_blocks} CVE probe request(s) blocked by WAF",
         }
 
     return {
-        "status": "NOT_REPRODUCED",
-        "fp_status": "NEEDS_REVIEW",
+        "status": "NOT_REPRODUCED", "fp_status": "NEEDS_REVIEW",
         "method": f"{cve_id} {probe['label']}",
         "evidence": f"CVE-specific probes did not trigger ({n_probes} endpoint(s) tried)",
     }
@@ -856,8 +745,7 @@ def verify_with_cwe(target_url: str, cwe: str, session,
 
     if dry_run:
         return {
-            "status": "DRY_RUN",
-            "fp_status": "NEEDS_REVIEW",
+            "status": "DRY_RUN", "fp_status": "NEEDS_REVIEW",
             "method": f"{probe['label']} active PoC (dry run)",
             "evidence": f"Would test {len(points)} point(s) × "
                         f"{len(probe['payloads'])} payload(s) on {target_url}",
@@ -896,8 +784,7 @@ def verify_with_cwe(target_url: str, cwe: str, session,
                 vuln, why = detect_signal(exploit, baseline, variant, probe)
                 if vuln:
                     return {
-                        "status": "CONFIRMED",
-                        "fp_status": "CONFIRMED",
+                        "status": "CONFIRMED", "fp_status": "CONFIRMED",
                         "method": f"{probe['label']} active PoC",
                         "evidence": f"{pt['url']} ({pt['method']}, "
                                     f"params={pt['params']}): {why}",
@@ -905,14 +792,12 @@ def verify_with_cwe(target_url: str, cwe: str, session,
 
     if waf_blocks:
         return {
-            "status": "WAF_BLOCKED",
-            "fp_status": "UNVERIFIED",
+            "status": "WAF_BLOCKED", "fp_status": "UNVERIFIED",
             "method": f"{probe['label']} active PoC",
             "evidence": f"{waf_blocks} request(s) blocked by WAF",
         }
     return {
-        "status": "NOT_REPRODUCED",
-        "fp_status": "LIKELY_FALSE_POSITIVE",
+        "status": "NOT_REPRODUCED", "fp_status": "LIKELY_FALSE_POSITIVE",
         "method": f"{probe['label']} active PoC",
         "evidence": "Payloads did not trigger any indicator",
     }
@@ -935,8 +820,7 @@ def verify_with_nuclei(target_url: str, cve_id: str,
         return None
     if dry_run:
         return {
-            "status": "DRY_RUN",
-            "fp_status": "NEEDS_REVIEW",
+            "status": "DRY_RUN", "fp_status": "NEEDS_REVIEW",
             "method": f"Nuclei {cve_id} (dry run)",
             "evidence": f"Would run nuclei -id {cve_id.lower()} against {target_url}",
         }
@@ -952,8 +836,7 @@ def verify_with_nuclei(target_url: str, cve_id: str,
         try:
             item = json.loads(proc.stdout.strip().split("\n")[0])
             return {
-                "status": "CONFIRMED",
-                "fp_status": "CONFIRMED",
+                "status": "CONFIRMED", "fp_status": "CONFIRMED",
                 "method": f"Nuclei {cve_id}",
                 "evidence": item.get("matched-at", "template triggered"),
             }
@@ -962,11 +845,9 @@ def verify_with_nuclei(target_url: str, cve_id: str,
 
     err = (proc.stderr or "").lower()
     if "no templates" in err or "could not find" in err or "no results found" in err:
-        return {"status": "NO_TEMPLATE",
-                "reason": f"No Nuclei template for {cve_id}"}
+        return {"status": "NO_TEMPLATE", "reason": f"No Nuclei template for {cve_id}"}
     return {
-        "status": "NOT_REPRODUCED",
-        "fp_status": "LIKELY_FALSE_POSITIVE",
+        "status": "NOT_REPRODUCED", "fp_status": "LIKELY_FALSE_POSITIVE",
         "method": f"Nuclei {cve_id}",
         "evidence": "Template ran but did not trigger",
     }
@@ -1009,7 +890,6 @@ def verify_findings(findings: List[dict], target_url: str,
         if waf:
             log.warning(f"WAF detected: {waf['vendor']} "
                         f"({', '.join(waf['evidence'][:3])})")
-            log.warning("Active PoCs may be blocked. Consider --waf-bypass.")
     except Exception as e:
         log.warning(f"Could not probe target: {e}")
 
@@ -1018,11 +898,14 @@ def verify_findings(findings: List[dict], target_url: str,
             log.warning("Interrupted — remaining findings left unverified.")
             break
 
+        # Skip informational findings (no CVE, no CWE)
+        if not finding.get("cve_id") and not finding.get("cwe"):
+            continue
+
         cve = (finding.get("cve_id") or "").upper() or None
         cwe = (finding.get("cwe") or [None])[0]
 
         if skip_confirmed and finding.get("false_positive_status") == "CONFIRMED":
-            log.info(f"[{i}/{len(findings)}] {cve or finding.get('id')} — skipped")
             continue
 
         log.info(f"[{i}/{len(findings)}] {cve or finding.get('id')} "
@@ -1060,15 +943,12 @@ def verify_findings(findings: List[dict], target_url: str,
             best = _best_attempt(attempts)
             if best:
                 finding["verification"] = best
-                log.info(f"    -> {best['status']}"
-                         f"{'/' + best['fp_status'] if best.get('fp_status') else ''}: "
-                         f"{best.get('evidence', best.get('reason',''))[:100]}")
+                log.info(f"    -> {best['status']}")
             else:
                 finding["verification"] = {
                     "status": "UNVERIFIED",
                     "reason": "No CVE probe, Nuclei template, or CWE probe available",
                 }
-                log.info("    -> UNVERIFIED (no PoC available)")
 
         if attempts:
             finding["verification_attempts"] = [
@@ -1095,8 +975,7 @@ def verify_findings(findings: List[dict], target_url: str,
 def run_nuclei_dast(target: str, severity: str = "critical,high,medium",
                     tags: str = "cve,vkev,kev", timeout: int = 900) -> List[dict]:
     if not check_nuclei():
-        log.error("Nuclei not installed. "
-                  "Get it: https://github.com/projectdiscovery/nuclei")
+        log.warning("Nuclei not installed — skipping DAST.")
         return []
     log.info(f"Running Nuclei against {target} (tags={tags})...")
     cmd = ["nuclei", "-u", target, "-tags", tags, "-jsonl", "-silent",
@@ -1135,7 +1014,146 @@ def run_nuclei_dast(target: str, severity: str = "critical,high,medium",
 
 
 # ================================================================
-# REPORTING (JSON + HTML only)
+# FULL NETWORK SCAN
+# ================================================================
+def full_network_scan(
+    target: str,
+    *, session: requests.Session,
+    do_port_scan: bool = True,
+    ports: Optional[Dict[int, str]] = None,
+    do_nuclei: bool = True,
+    severity: str = "critical,high,medium",
+    tags: str = "cve,vkev,kev",
+    nuclei_timeout: int = 900,
+) -> List[dict]:
+    """
+    Full scan pipeline:
+      1. Normalize target → candidate URLs
+      2. Detect working URL
+      3. Port scan (optional)
+      4. Banner grab on open ports
+      5. HTTP fingerprint
+      6. Banner CPE lookup
+      7. Nuclei DAST (optional)
+    """
+    candidates = normalize_target(target)
+    log.info(f"Normalized target → {candidates}")
+
+    working = detect_working_url(candidates)
+    if working:
+        url, status = working
+        log.info(f"Working URL: {url} (HTTP {status})")
+    else:
+        url = None
+        log.warning("No HTTP/HTTPS endpoint responded — scanning network layer only")
+
+    host = extract_host(target)
+    log.info(f"Host: {host}")
+
+    findings: List[dict] = []
+
+    # ── Port scan ──
+    open_ports: Dict[int, str] = {}
+    if do_port_scan:
+        log.info("Port scanning...")
+        open_ports = port_scan(host, ports=ports)
+        if open_ports:
+            log.info(f"Open ports: {sorted(open_ports.keys())}")
+            for port, service in sorted(open_ports.items()):
+                findings.append({
+                    "package": f"port-{port}",
+                    "version": "",
+                    "ecosystem": "Network",
+                    "source": "PortScan",
+                    "summary": f"Port {port} open ({service})",
+                    "port": port,
+                    "service": service,
+                    "cve_id": None,
+                    "cwe": [],
+                    "false_positive_status": "CONFIRMED",
+                    "false_positive_reason": "TCP connect succeeded",
+                    "priority": "INFO",
+                })
+        else:
+            log.info("No common ports open.")
+
+    # ── Banner grab + CPE lookup ──
+    if open_ports and _HAVE_FINGERPRINT:
+        log.info("Grabbing banners...")
+        for port in open_ports:
+            if _SHUTDOWN.is_set():
+                break
+            banner = auto_banner_grab(host, port)
+            if not banner:
+                continue
+            log.info(f"Banner on {port}: {banner[:100]!r}")
+
+            detected, fp_findings = fingerprint_banner(
+                banner, session, limiter=_NVD_LIMITER.wait
+            )
+            if detected:
+                log.info(f"  Identified: {detected}")
+                for name, version in detected.items():
+                    findings.append({
+                        "package": name.lower(),
+                        "version": version,
+                        "ecosystem": "Banner",
+                        "source": "Banner",
+                        "summary": f"{name} {version} detected on port {port}",
+                        "port": port,
+                        "cve_id": None,
+                        "cwe": [],
+                        "false_positive_status": "CONFIRMED",
+                        "false_positive_reason": f"Version found in banner on port {port}",
+                        "priority": "INFO",
+                    })
+            if fp_findings:
+                findings.extend(fp_findings)
+
+    # ── HTTP fingerprint + Nuclei ──
+    if url:
+        if _HAVE_FINGERPRINT:
+            log.info("HTTP fingerprinting...")
+            detected, fp_findings = fingerprint_http(
+                url, session, limiter=_NVD_LIMITER.wait
+            )
+            if detected:
+                log.info(f"Detected: {detected}")
+                for name, version in detected.items():
+                    findings.append({
+                        "package": name.lower(),
+                        "version": version,
+                        "ecosystem": "HTTP",
+                        "source": "Fingerprint",
+                        "summary": f"{name} {version} detected via HTTP",
+                        "cve_id": None,
+                        "cwe": [],
+                        "false_positive_status": "CONFIRMED",
+                        "false_positive_reason": "Version found in HTTP response",
+                        "priority": "INFO",
+                    })
+            if fp_findings:
+                findings.extend(fp_findings)
+
+        if do_nuclei:
+            log.info("Running Nuclei DAST...")
+            findings.extend(run_nuclei_dast(url, severity, tags, nuclei_timeout))
+
+    # Deduplicate by (cve_id, package, port)
+    seen = set()
+    deduped = []
+    for f in findings:
+        key = (f.get("cve_id"), f.get("package"), f.get("port"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(f)
+
+    return deduped
+
+
+# ================================================================
+# REPORTING (JSON + HTML)
 # ================================================================
 def save_json(findings: List[dict], path: Path) -> None:
     path.write_text(json.dumps(findings, indent=2, ensure_ascii=False))
@@ -1143,18 +1161,19 @@ def save_json(findings: List[dict], path: Path) -> None:
 
 
 def save_html(findings: List[dict], path: Path) -> None:
-    order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4}
+    order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4, "UNKNOWN": 5}
     rows = []
-    for f in sorted(findings, key=lambda x: (order.get(x.get("priority"), 4),
+    for f in sorted(findings, key=lambda x: (order.get(x.get("priority"), 5),
                                               -(x.get("epss") or 0))):
-        cve = f.get("cve_id") or f.get("id") or "UNKNOWN"
+        cve = f.get("cve_id") or f.get("id") or "—"
         cwe_list = f.get("cwe") or []
-        cwe_name = cwe_friendly(cwe_list[0]) if cwe_list else "Unknown"
+        cwe_name = cwe_friendly(cwe_list[0]) if cwe_list else "—"
         prio = f.get("priority", "UNKNOWN")
         fp = f.get("false_positive_status", "UNKNOWN")
         reason = (f.get("false_positive_reason") or "")[:200]
         color = {"CRITICAL": "#b71c1c", "HIGH": "#d84315",
-                 "MEDIUM": "#f57f17", "LOW": "#2e7d32"}.get(prio, "#555")
+                 "MEDIUM": "#f57f17", "LOW": "#2e7d32",
+                 "INFO": "#1976d2"}.get(prio, "#555")
         fp_color = {"CONFIRMED": "#b71c1c", "LIKELY_REAL": "#d84315",
                     "NEEDS_REVIEW": "#f57f17", "LIKELY_FALSE_POSITIVE": "#2e7d32",
                     "UNVERIFIED": "#555"}.get(fp, "#555")
@@ -1192,19 +1211,19 @@ small{{color:#666}}.meta{{color:#666;margin-bottom:16px}}
 
 def print_report(findings: List[dict]) -> None:
     if not findings:
-        print("\n[+] No known vulnerabilities found.")
+        print("\n[+] No findings.")
         return
-    order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4}
-    findings.sort(key=lambda f: (order.get(f.get("priority"), 4),
+    order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4, "UNKNOWN": 5}
+    findings.sort(key=lambda f: (order.get(f.get("priority"), 5),
                                  -(f.get("epss") or 0)))
     print("\n" + "=" * 88)
     print(f"SCAN RESULTS: {len(findings)} finding(s)")
     print("=" * 88)
     for f in findings:
-        cve = f.get("cve_id") or f.get("id") or "UNKNOWN"
+        cve = f.get("cve_id") or f.get("id") or "—"
         cwe_list = f.get("cwe") or []
-        cwe_name = cwe_friendly(cwe_list[0]) if cwe_list else "Unknown"
-        cwe_str = ", ".join(cwe_list) if cwe_list else "N/A"
+        cwe_name = cwe_friendly(cwe_list[0]) if cwe_list else "—"
+        cwe_str = ", ".join(cwe_list) if cwe_list else "—"
         prio = f.get("priority", "UNKNOWN")
         fp = f.get("false_positive_status", "UNKNOWN")
         reason = f.get("false_positive_reason", "")
@@ -1215,14 +1234,13 @@ def print_report(findings: List[dict]) -> None:
         print(f"\n[{prio}] {cve}  ({cwe_name})")
         print(f"  Package   : {f.get('package','?')} {f.get('version','')} "
               f"({f.get('ecosystem','')})")
-        print(f"  CWE Type  : {cwe_str} — {cwe_name}")
+        if cwe_str != "—":
+            print(f"  CWE Type  : {cwe_str} — {cwe_name}")
         print(f"  FP Status : {fp}")
         if reason: print(f"  Reason    : {reason[:180]}")
         if flags:  print(f"  Signals   : {'  '.join(flags)}")
         if f.get("summary"):
             print(f"  Summary   : {f['summary'][:200]}")
-        if f.get("matched_at"):
-            print(f"  Matched   : {f['matched_at']}")
         attempts = f.get("verification_attempts")
         if attempts:
             print("  Attempts  :")
@@ -1258,8 +1276,7 @@ def _setup_sigint() -> None:
         if _SHUTDOWN.is_set():
             log.warning("Forcing exit.")
             sys.exit(130)
-        log.warning("Interrupt received — finishing current request, "
-                    "then saving partial results (Ctrl+C again to force).")
+        log.warning("Interrupt received — saving partial results (Ctrl+C again to force).")
         _SHUTDOWN.set()
     signal.signal(signal.SIGINT, handler)
 
@@ -1272,12 +1289,23 @@ def _parse_header_arg(value: str) -> Tuple[str, str]:
     return k.strip(), v.strip()
 
 
-def _validate_target(url: str) -> str:
-    p = urlparse(url)
-    if p.scheme not in ("http", "https"):
-        raise argparse.ArgumentTypeError(
-            f"Target must start with http:// or https://, got: {url}")
-    return url
+def _parse_ports_arg(value: str) -> Dict[int, str]:
+    """Parse '80,443,8080' or '80:HTTP,443:HTTPS' into {port: name}."""
+    result = {}
+    for token in value.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if ":" in token:
+            port_str, _, name = token.partition(":")
+        else:
+            port_str, name = token, "Custom"
+        try:
+            port = int(port_str)
+            result[port] = name.upper() if name else "Custom"
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"Invalid port: {port_str}")
+    return result
 
 
 def _apply_profile(args) -> None:
@@ -1291,18 +1319,19 @@ def _apply_profile(args) -> None:
 # ================================================================
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description=f"Free CVE scanner — scan deps or URLs, probe with PoCs, "
-                    f"fingerprint host libraries (v{__version__})",
+        description=f"Free network-focused CVE scanner with active PoC verification "
+                    f"(v{__version__})",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python scanner.py scan requirements.txt -o findings.json --html report.html
-  python scanner.py scan package.json
-  python scanner.py scan https://staging.example.com --severity critical,high
-  python scanner.py probe findings.json --target https://staging.example.com \\
+  python scanner.py scan 192.168.1.1 -o findings.json --html report.html
+  python scanner.py scan example.com -o findings.json --html report.html
+  python scanner.py scan https://staging.example.com -o findings.json
+  python scanner.py scan 10.0.0.5:8080 --ports 8080,8443,22,3306
+  python scanner.py scan example.com --no-port-scan --no-nuclei
+  python scanner.py probe findings.json --target example.com -o verified.json
+  python scanner.py probe findings.json --target 192.168.1.1 --fingerprint \\
       --header "Authorization: Bearer $TOKEN" -o verified.json --html verified.html
-  python scanner.py probe findings.json --target https://staging.example.com \\
-      --fingerprint -o verified.json --html verified.html
   python scanner.py enrich CVE-2024-3400
   python scanner.py --list-cves
   python scanner.py --list-payloads
@@ -1311,64 +1340,69 @@ Examples:
     ap.add_argument("--version", action="version",
                     version=f"cve_scanner {__version__}")
     ap.add_argument("-v", "--verbose", action="count", default=0)
-    ap.add_argument("--list-payloads", action="store_true",
-                    help="Print all CWE probes and exit")
-    ap.add_argument("--list-cves", action="store_true",
-                    help="Print all CVE probes and exit")
+    ap.add_argument("--list-payloads", action="store_true")
+    ap.add_argument("--list-cves", action="store_true")
 
     sub = ap.add_subparsers(dest="command")
 
+    # ── scan ──
     p_scan = sub.add_parser(
         "scan",
-        help="Scan a dependency file (OSV) or a URL (Nuclei DAST)",
+        help="Scan an IP, domain, or URL (port scan + fingerprint + Nuclei)",
     )
     p_scan.add_argument("target",
-                        help="requirements.txt, package.json, or https://...")
-    p_scan.add_argument("-o", "--output", type=Path, help="JSON output path")
-    p_scan.add_argument("--html", type=Path, help="HTML output path")
-    p_scan.add_argument("--workers", type=int, default=8,
-                        help="Concurrent workers for dep scan (default 8)")
+                        help="IP (192.168.1.1), domain (example.com), "
+                             "or URL (https://example.com)")
+    p_scan.add_argument("-o", "--output", type=Path, help="JSON output")
+    p_scan.add_argument("--html", type=Path, help="HTML output")
+    p_scan.add_argument("--ports", type=_parse_ports_arg, default=None,
+                        help="Custom ports, e.g. '80,443,8080:HTTP-Alt' "
+                             "(default: common ports)")
+    p_scan.add_argument("--no-port-scan", action="store_true",
+                        help="Skip port scan")
+    p_scan.add_argument("--no-nuclei", action="store_true",
+                        help="Skip Nuclei DAST")
     p_scan.add_argument("--severity", default="critical,high,medium",
-                        help="DAST severity filter")
+                        help="Nuclei severity filter")
     p_scan.add_argument("--tags", default="cve,vkev,kev",
-                        help="DAST template tags")
-    p_scan.add_argument("--timeout", type=int, default=900,
-                        help="DAST scan timeout in seconds")
+                        help="Nuclei template tags")
+    p_scan.add_argument("--nuclei-timeout", type=int, default=900)
+    p_scan.add_argument("--insecure", action="store_true")
+    p_scan.add_argument("--header", action="append", type=_parse_header_arg,
+                        default=[])
+    p_scan.add_argument("--basic-auth", type=str, default=None)
+    p_scan.add_argument("--cookie", type=str, default=None)
+    p_scan.add_argument("--workers", type=int, default=4,
+                        help="NVD enrichment workers")
 
+    # ── probe ──
     p_probe = sub.add_parser(
         "probe",
         help="Verify findings against a live target with CVE + CWE PoCs",
     )
     p_probe.add_argument("report", type=Path,
-                         help="Findings JSON produced by `scan`")
-    p_probe.add_argument("--target", required=True, type=_validate_target,
-                         help="Live target URL")
-    p_probe.add_argument("-o", "--output", type=Path, help="JSON output path")
-    p_probe.add_argument("--html", type=Path, help="HTML output path")
+                         help="Findings JSON from `scan`")
+    p_probe.add_argument("--target", required=True,
+                         help="IP, domain, or URL")
+    p_probe.add_argument("-o", "--output", type=Path)
+    p_probe.add_argument("--html", type=Path)
     p_probe.add_argument("--skip-confirmed", action="store_true")
-    p_probe.add_argument("--dry-run", action="store_true",
-                         help="Show planned probes without sending payloads")
-    p_probe.add_argument("--waf-bypass", action="store_true",
-                         help="Apply payload mutation to evade WAFs")
-    p_probe.add_argument("--insecure", action="store_true",
-                         help="Skip TLS certificate verification")
+    p_probe.add_argument("--dry-run", action="store_true")
+    p_probe.add_argument("--waf-bypass", action="store_true")
+    p_probe.add_argument("--insecure", action="store_true")
     p_probe.add_argument("--header", action="append", type=_parse_header_arg,
-                         default=[], help="HTTP header 'K: V' (repeatable)")
-    p_probe.add_argument("--basic-auth", type=str, default=None,
-                         help="Basic auth user:pass")
-    p_probe.add_argument("--cookie", type=str, default=None,
-                         help="Cookie header value")
-    p_probe.add_argument("--rate", type=float, default=0.0,
-                         help="Requests per second (0 = unlimited)")
-    p_probe.add_argument("--jitter", type=float, default=0.0,
-                         help="Random delay jitter in seconds")
+                         default=[])
+    p_probe.add_argument("--basic-auth", type=str, default=None)
+    p_probe.add_argument("--cookie", type=str, default=None)
+    p_probe.add_argument("--rate", type=float, default=0.0)
+    p_probe.add_argument("--jitter", type=float, default=0.0)
     p_probe.add_argument("--profile",
                          choices=["stealth", "normal", "aggressive"],
                          default="normal")
     p_probe.add_argument("--fingerprint", action="store_true",
-                         help="Detect host libraries/versions and add "
-                              "version-based CVEs via NVD CPE")
+                         help="Add HTTP fingerprint + CPE findings")
 
+    # ── enrich ──
     p_enrich = sub.add_parser("enrich", help="Look up a single CVE")
     p_enrich.add_argument("cve_id")
 
@@ -1401,18 +1435,26 @@ Examples:
         ap.print_help()
         return
 
+    # ── scan ──
     if args.command == "scan":
-        target = args.target
-        if target.startswith(("http://", "https://")):
-            findings = run_nuclei_dast(
-                target, args.severity, args.tags, args.timeout
-            )
-        else:
-            path = Path(target)
-            if not path.exists():
-                log.error(f"File not found: {path}")
-                sys.exit(1)
-            findings = scan_dependencies(path, args.workers)
+        user_headers = {k: v for k, v in args.header}
+        basic_auth = tuple(args.basic_auth.split(":", 1)) \
+                     if args.basic_auth else None
+        session = build_session(insecure=args.insecure,
+                                user_headers=user_headers,
+                                basic_auth=basic_auth,
+                                cookie=args.cookie)
+
+        findings = full_network_scan(
+            args.target,
+            session=session,
+            do_port_scan=not args.no_port_scan,
+            ports=args.ports,
+            do_nuclei=not args.no_nuclei,
+            severity=args.severity,
+            tags=args.tags,
+            nuclei_timeout=args.nuclei_timeout,
+        )
 
         if findings:
             findings = enrich_findings(findings, workers=args.workers)
@@ -1421,6 +1463,7 @@ Examples:
         if args.output: save_json(findings, args.output)
         if args.html:   save_html(findings, args.html)
 
+    # ── probe ──
     elif args.command == "probe":
         if not args.report.exists():
             log.error(f"Report not found: {args.report}")
@@ -1435,35 +1478,37 @@ Examples:
                                 user_headers=user_headers,
                                 basic_auth=basic_auth,
                                 cookie=args.cookie)
+
+        # Normalize + find working URL
+        candidates = normalize_target(args.target)
+        working = detect_working_url(candidates, insecure=args.insecure)
+        if working:
+            url = working[0]
+            log.info(f"Probing {url}")
+        else:
+            log.error("Target does not respond to HTTP/HTTPS")
+            sys.exit(1)
+
+        # Optional fingerprint
+        if args.fingerprint and _HAVE_FINGERPRINT:
+            log.info("Fingerprinting target...")
+            detected, fp_findings = fingerprint_http(
+                url, session, limiter=_NVD_LIMITER.wait
+            )
+            if detected:
+                log.info(f"Detected: {detected}")
+            if fp_findings:
+                existing = {f.get("cve_id") for f in findings if f.get("cve_id")}
+                added = 0
+                for fp in fp_findings:
+                    if fp["cve_id"] not in existing:
+                        findings.append(fp)
+                        added += 1
+                log.info(f"Added {added} fingerprint-based CVE finding(s)")
+
         limiter = RateLimiter(rate=args.rate, jitter=args.jitter)
-
-        # ── NEW: fingerprint host and merge version-based CVEs ──
-        if args.fingerprint:
-            if not _HAVE_FINGERPRINT:
-                log.warning("--fingerprint requested but fingerprint.py not "
-                            "found — skipping")
-            else:
-                log.info("Fingerprinting target...")
-                detected, fp_findings = fingerprint_and_lookup(
-                    args.target, session, limiter=_NVD_LIMITER.wait
-                )
-                if detected:
-                    pretty = ", ".join(f"{k} {v}" for k, v in detected.items())
-                    log.info(f"Detected: {pretty}")
-                if fp_findings:
-                    existing = {f.get("cve_id") for f in findings
-                                if f.get("cve_id")}
-                    added = 0
-                    for fp in fp_findings:
-                        if fp["cve_id"] not in existing:
-                            findings.append(fp)
-                            added += 1
-                    log.info(f"Added {added} version-based CVE finding(s)")
-
-        ensure_metadata(findings)
-
         findings = verify_findings(
-            findings, args.target,
+            findings, url,
             session=session, limiter=limiter,
             skip_confirmed=args.skip_confirmed,
             waf_bypass=args.waf_bypass,
@@ -1473,10 +1518,11 @@ Examples:
         if args.output: save_json(findings, args.output)
         if args.html:   save_html(findings, args.html)
 
+    # ── enrich ──
     elif args.command == "enrich":
         cve = args.cve_id.upper()
         if not re.match(r"^CVE-\d{4}-\d{4,}$", cve):
-            log.error(f"Invalid CVE ID: {cve} (expected CVE-YYYY-NNNN)")
+            log.error(f"Invalid CVE ID: {cve}")
             sys.exit(1)
         kev = fetch_kev()
         epss = fetch_epss_batch([cve])
@@ -1486,7 +1532,7 @@ Examples:
         has_probe = cve in CVE_PROBES
         print(f"\nCVE      : {cve}")
         print(f"In KEV   : {'YES — actively exploited' if cve in kev else 'NO'}")
-        print(f"EPSS     : {epss.get(cve, 0.0):.2%}")
+        print(f CLI"EPSS     : {ep +ss.get(cve, 0.0):.2% orche}")
         print(f"CVSS     : {cvss if cvss is not None else 'N/A'}")
         print(f"CWE Type : {cwe_list_friendly(cwes)}")
         probe_note = (
