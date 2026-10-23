@@ -1,16 +1,27 @@
-# Inspect both libraries
-python scanner.py --list-cves       # 18 CVE-specific probes
-python scanner.py --list-payloads   # 15 CWE-based probes
-
 # Scan dependencies
-python scanner.py deps requirements.txt -o findings.json --html report.html
+python scanner.py scan requirements.txt -o findings.json --html report.html
 
-# Verify with all methods (CVE → Nuclei → CWE)
-python scanner.py verify findings.json \
-    --target https://staging.example.com \
-    --header "Authorization: Bearer $TOKEN" \
-    --rate 2 --profile stealth --insecure \
-    -o verified.json --sarif verified.sarif
+# Scan npm deps
+python scanner.py scan package.json -o findings.json
 
-# Single CVE lookup (also shows if a CVE PoC is bundled)
+# Scan URL via Nuclei DAST
+python scanner.py scan https://staging.example.com -o dast.json
+
+# Probe findings against live target
+python scanner.py probe findings.json --target https://staging.example.com \
+    --header "Authorization: Bearer $TOKEN" -o verified.json --html verified.html
+
+# Dry-run (no payloads sent)
+python scanner.py probe findings.json --target https://staging.example.com --dry-run
+
+# Authenticated probe with WAF evasion
+python scanner.py probe findings.json --target https://app.example.com \
+    --basic-auth admin:pass --cookie "session=abc" --waf-bypass \
+    --profile stealth --insecure -o verified.json
+
+# Look up one CVE
 python scanner.py enrich CVE-2024-3400
+
+# Inspect libraries
+python scanner.py --list-cves
+python scanner.py --list-payloads
