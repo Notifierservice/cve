@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-scanner.py — Free CVE scanner with CVE + CWE PoC verification.
+scanner.py — Free CVE scanner with CVE + CWE PoC verification and host
+fingerprinting.
 
 ⚠️  AUTHORIZED USE ONLY
-`probe` and `scan <url>` send real exploit payloads. Use only against
-systems you own or have written permission to test. `scan <file>` and
-`enrich` only touch public vulnerability databases.
+`probe` and `scan <url>` send real exploit payloads. Use only against systems
+you own or have written permission to test.
 
 Commands:
-  scan    Scan a dependency file (requirements.txt / package.json) OR a URL (DAST)
+  scan    Scan a dependency file OR a URL (Nuclei DAST)
   probe   Verify findings against a live target with CVE + CWE PoCs
+          (optionally fingerprint host libraries via NVD CPE)
   enrich  Look up a single CVE
 
 Usage:
@@ -18,6 +19,8 @@ Usage:
   python scanner.py scan https://staging.example.com
   python scanner.py probe findings.json --target https://staging.example.com \\
       --header "Authorization: Bearer $TOKEN" -o verified.json --html verified.html
+  python scanner.py probe findings.json --target https://staging.example.com \\
+      --fingerprint -o verified.json --html verified.html
   python scanner.py enrich CVE-2024-3400
   python scanner.py --list-cves
   python scanner.py --list-payloads
@@ -60,26 +63,15 @@ try:
 except Exception:
     pass
 
-# ── Payload library (must live in payloads.py next to this file) ──
+# ── Payload library ──
 try:
     from payloads import (
-        CWE_NAMES,
-        CVE_PROBES,
-        CWE_PROBES,
-        WAF_FINGERPRINTS,
-        SQL_ERROR_SIGNATURES,
-        XSS_SIGNATURES,
-        LFI_SIGNATURES,
-        RCE_SIGNATURES,
-        SSTI_SIGNATURES,
-        SSRF_SIGNATURES,
-        XXE_SIGNATURES,
-        DESERIALIZATION_SIGNATURES,
-        OPEN_REDIRECT_SIGNATURES,
-        NOSQL_SIGNATURES,
-        LDAP_SIGNATURES,
-        XPATH_SIGNATURES,
-        CRLF_SIGNATURES,
+        CWE_NAMES, CVE_PROBES, CWE_PROBES, WAF_FINGERPRINTS,
+        SQL_ERROR_SIGNATURES, XSS_SIGNATURES, LFI_SIGNATURES,
+        RCE_SIGNATURES, SSTI_SIGNATURES, SSRF_SIGNATURES,
+        XXE_SIGNATURES, DESERIALIZATION_SIGNATURES,
+        OPEN_REDIRECT_SIGNATURES, NOSQL_SIGNATURES,
+        LDAP_SIGNATURES, XPATH_SIGNATURES, CRLF_SIGNATURES,
     )
 except ImportError as e:
     print(f"Error importing payloads: {e}", file=sys.stderr)
@@ -87,11 +79,19 @@ except ImportError as e:
           file=sys.stderr)
     sys.exit(1)
 
+# ── Fingerprinting (optional) ──
+try:
+    from fingerprint import fingerprint_and_lookup
+    _HAVE_FINGERPRINT = True
+except ImportError:
+    _HAVE_FINGERPRINT = False
+    fingerprint_and_lookup = None
+
 
 # ================================================================
 # CONFIG
 # ================================================================
-__version__ = "8.1.0"
+__version__ = "9.0.0"
 
 OSV_API  = "https://api.osv.dev/v1/query"
 NVD_API  = "https://services.nvd.nist.gov/rest/json/cves/2.0"
@@ -109,7 +109,7 @@ _SHUTDOWN = threading.Event()
 
 
 # ================================================================
-# CWE NAME HELPERS  (thin wrappers around CWE_NAMES from payloads.py)
+# CWE NAME HELPERS
 # ================================================================
 def cwe_friendly(cwe_id: str) -> str:
     return CWE_NAMES.get(cwe_id, cwe_id or "Unknown")
@@ -137,8 +137,10 @@ def _normalize_signatures(signatures) -> Iterable[Tuple[str, str]]:
 
 
 def match_signatures(
-    text: str, signatures,
-    *, baseline_text: Optional[str] = None,
+    text: str,
+    signatures,
+    *,
+    baseline_text: Optional[str] = None,
     case_insensitive: bool = True,
 ) -> List[str]:
     flags = re.IGNORECASE if case_insensitive else 0
@@ -392,7 +394,8 @@ def parse_package_json(path: Path) -> List[Tuple[str, str]]:
 def osv_query(package: str, version: str, ecosystem: str) -> List[dict]:
     if not version:
         return []
-    payload = {"package": {"name": package, "ecosystem": ecosystem}, "version": version}
+    payload = {"package": {"name": package, "ecosystem": ecosystem},
+               "version": version}
     try:
         return http_post(OSV_API, payload).get("vulns", [])
     except Exception as e:
@@ -597,7 +600,8 @@ def extract_injection_points(html: str, base_url: str) -> List[dict]:
 
     parsed = urlparse(base_url)
     if parsed.query:
-        add(base_url, "GET", list(parse_qs(parsed.query, keep_blank_values=True).keys()))
+        add(base_url, "GET",
+            list(parse_qs(parsed.query, keep_blank_values=True).keys()))
     for f in extract_forms(html, base_url):
         add(f["url"], f["method"], f["params"])
     return points
@@ -958,7 +962,8 @@ def verify_with_nuclei(target_url: str, cve_id: str,
 
     err = (proc.stderr or "").lower()
     if "no templates" in err or "could not find" in err or "no results found" in err:
-        return {"status": "NO_TEMPLATE", "reason": f"No Nuclei template for {cve_id}"}
+        return {"status": "NO_TEMPLATE",
+                "reason": f"No Nuclei template for {cve_id}"}
     return {
         "status": "NOT_REPRODUCED",
         "fp_status": "LIKELY_FALSE_POSITIVE",
@@ -1130,7 +1135,7 @@ def run_nuclei_dast(target: str, severity: str = "critical,high,medium",
 
 
 # ================================================================
-# REPORTING (JSON + HTML)
+# REPORTING (JSON + HTML only)
 # ================================================================
 def save_json(findings: List[dict], path: Path) -> None:
     path.write_text(json.dumps(findings, indent=2, ensure_ascii=False))
@@ -1286,8 +1291,8 @@ def _apply_profile(args) -> None:
 # ================================================================
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description=f"Free CVE scanner — scan deps or URLs, probe with PoCs "
-                    f"(v{__version__})",
+        description=f"Free CVE scanner — scan deps or URLs, probe with PoCs, "
+                    f"fingerprint host libraries (v{__version__})",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1296,6 +1301,8 @@ Examples:
   python scanner.py scan https://staging.example.com --severity critical,high
   python scanner.py probe findings.json --target https://staging.example.com \\
       --header "Authorization: Bearer $TOKEN" -o verified.json --html verified.html
+  python scanner.py probe findings.json --target https://staging.example.com \\
+      --fingerprint -o verified.json --html verified.html
   python scanner.py enrich CVE-2024-3400
   python scanner.py --list-cves
   python scanner.py --list-payloads
@@ -1358,6 +1365,9 @@ Examples:
     p_probe.add_argument("--profile",
                          choices=["stealth", "normal", "aggressive"],
                          default="normal")
+    p_probe.add_argument("--fingerprint", action="store_true",
+                         help="Detect host libraries/versions and add "
+                              "version-based CVEs via NVD CPE")
 
     p_enrich = sub.add_parser("enrich", help="Look up a single CVE")
     p_enrich.add_argument("cve_id")
@@ -1416,7 +1426,6 @@ Examples:
             log.error(f"Report not found: {args.report}")
             sys.exit(1)
         findings = json.loads(args.report.read_text())
-        ensure_metadata(findings)
         _apply_profile(args)
 
         user_headers = {k: v for k, v in args.header}
@@ -1427,6 +1436,31 @@ Examples:
                                 basic_auth=basic_auth,
                                 cookie=args.cookie)
         limiter = RateLimiter(rate=args.rate, jitter=args.jitter)
+
+        # ── NEW: fingerprint host and merge version-based CVEs ──
+        if args.fingerprint:
+            if not _HAVE_FINGERPRINT:
+                log.warning("--fingerprint requested but fingerprint.py not "
+                            "found — skipping")
+            else:
+                log.info("Fingerprinting target...")
+                detected, fp_findings = fingerprint_and_lookup(
+                    args.target, session, limiter=_NVD_LIMITER.wait
+                )
+                if detected:
+                    pretty = ", ".join(f"{k} {v}" for k, v in detected.items())
+                    log.info(f"Detected: {pretty}")
+                if fp_findings:
+                    existing = {f.get("cve_id") for f in findings
+                                if f.get("cve_id")}
+                    added = 0
+                    for fp in fp_findings:
+                        if fp["cve_id"] not in existing:
+                            findings.append(fp)
+                            added += 1
+                    log.info(f"Added {added} version-based CVE finding(s)")
+
+        ensure_metadata(findings)
 
         findings = verify_findings(
             findings, args.target,
