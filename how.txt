@@ -1,16 +1,16 @@
 # Inspect both libraries
-python cve_scanner.py --list-cves       # 18 CVE-specific probes
-python cve_scanner.py --list-payloads   # 15 CWE-based probes
+python scanner.py --list-cves       # 18 CVE-specific probes
+python scanner.py --list-payloads   # 15 CWE-based probes
 
 # Scan dependencies
-python cve_scanner.py deps requirements.txt -o findings.json --html report.html
+python scanner.py deps requirements.txt -o findings.json --html report.html
 
 # Verify with all methods (CVE → Nuclei → CWE)
-python cve_scanner.py verify findings.json \
+python scanner.py verify findings.json \
     --target https://staging.example.com \
     --header "Authorization: Bearer $TOKEN" \
     --rate 2 --profile stealth --insecure \
     -o verified.json --sarif verified.sarif
 
 # Single CVE lookup (also shows if a CVE PoC is bundled)
-python cve_scanner.py enrich CVE-2024-3400
+python scanner.py enrich CVE-2024-3400
