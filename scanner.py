@@ -60,7 +60,7 @@ except Exception:
 
 # ── Network helpers ──
 try:
-    from network import (
+    from mod.network import (
         normalize_target, extract_host, extract_port,
         port_scan, auto_banner_grab, tls_info,
         detect_working_url, COMMON_PORTS,
@@ -73,7 +73,7 @@ except ImportError as e:
 
 # ── Fingerprinting ──
 try:
-    from fingerprint import fingerprint_http, fingerprint_banner
+    from mod.fingerprint import fingerprint_http, fingerprint_banner
     _HAVE_FINGERPRINT = True
 except ImportError:
     _HAVE_FINGERPRINT = False
@@ -81,7 +81,7 @@ except ImportError:
 
 # ── Payload library ──
 try:
-    from payloads import (
+    from mod.payloads import (
         CWE_NAMES, CVE_PROBES, CWE_PROBES, WAF_FINGERPRINTS,
         SQL_ERROR_SIGNATURES, XSS_SIGNATURES, LFI_SIGNATURES,
         RCE_SIGNATURES, SSTI_SIGNATURES, SSRF_SIGNATURES,
@@ -108,7 +108,7 @@ EPSS_API = "https://api.first.org/data/v1/epss"
 NVD_API_KEY     = os.getenv("NVD_API_KEY")
 NVD_MAX_RETRIES = 3
 
-CACHE_DIR = Path.home() / ".cache" / "cve_scanner"
+CACHE_DIR = "cve_scanner"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 log = logging.getLogger("cve_scanner")
