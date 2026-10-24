@@ -1,13 +1,3 @@
-#!/usr/bin/env python3
-"""
-standalone_scanner.py — Single-file, pure-Python network CVE scanner with
-auto-scan and auto-probe.
-
-Uses only the Python 3.8+ standard library. No external dependencies.
-
-Edit the CONFIG section below, then run:
-    python standalone_scanner.py
-"""
 from __future__ import annotations
 
 import base64
